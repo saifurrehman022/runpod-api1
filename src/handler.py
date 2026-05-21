@@ -264,7 +264,7 @@ def handler(job):
             "mount_listings": [
                 safe_listdir("/"),
                 safe_listdir("/workspace"),
-                safe_listdir("/workspace/wan-storage"),
+                safe_listdir("/workspace/criminal_jade_guineafowl"),
                 safe_listdir("/runpod-volume"),
                 safe_listdir(f"/runpod-volume/{LORA_DIR_REL}"),
             ],
