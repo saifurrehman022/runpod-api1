@@ -86,7 +86,7 @@ RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
 #   WanVeoModelLoader, WanVideoSampler, WanVideoEncode,
 #   WanVideoVAELoader, WanVideoImageClipEncode, WanVideoTextEmbedBridge,
-#   WanVideoExperimentalArgs, WanVideoCacheArgs, WanVideoSLGArgs
+#   WanVideoExprimentalArgs, WanVideoCacheArgs, WanVideoSLGArgs
 RUN comfy-node-install ComfyUI-WanVideoWrapper
 
 # Video Helper Suite — provides VHS_VideoCombine (output node in workflow)
