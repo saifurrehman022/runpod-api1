@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile  (FIXED)
+# 
 #
 # What changed from original:
 #   - Added ComfyUI-WanVideoWrapper (CRITICAL — workflow uses 9 node types from it)
