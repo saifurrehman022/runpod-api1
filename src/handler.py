@@ -13,13 +13,9 @@ COMFY_READY_POLL = 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Registry / LoRA config
-# All three things must agree on these two values:
-#   1. This file (REGISTRY_REL / LORA_DIR_REL)
-#   2. tools/check_lora_sidecars.py  (LORA_DIR)
-#   3. src/extra_model_paths.yaml    (loras path)
 # ─────────────────────────────────────────────────────────────────────────────
-LORA_DIR_REL   = "models/loras"                          # was: models/lora-video
-REGISTRY_REL   = f"{LORA_DIR_REL}/registry.json"        # was: registry.generated.json
+LORA_DIR_REL = "models/loras"
+REGISTRY_REL = f"{LORA_DIR_REL}/registry.json"
 
 REGISTRY_CANDIDATE_BASES = [
     "/workspace/criminal_jade_guineafowl",
@@ -40,10 +36,39 @@ COMFY_LOG_CANDIDATES = [
     "/comfyui/ComfyUI/user/comfyui.log",
 ]
 
+# Known node-pack hints for clearer errors
+NODE_PACK_HINTS = {
+    "WanVideoModelLoader": "ComfyUI-WanVideoWrapper",
+    "WanVideoTextEncode": "ComfyUI-WanVideoWrapper",
+    "WanVideoTextEmbedBridge": "ComfyUI-WanVideoWrapper",
+    "WanVideoVAELoader": "ComfyUI-WanVideoWrapper",
+    "WanVideoEncode": "ComfyUI-WanVideoWrapper",
+    "WanVideoDecode": "ComfyUI-WanVideoWrapper",
+    "WanVideoSampler": "ComfyUI-WanVideoWrapper",
+    "WanVideoSLG": "ComfyUI-WanVideoWrapper",
+    "WanVideoEasyCache": "ComfyUI-WanVideoWrapper",
+    "WanVideoExperimentalArgs": "ComfyUI-WanVideoWrapper",
+    "WanVideoTorchCompileSettings": "ComfyUI-WanVideoWrapper",
+    "LoadWanVideoT5TextEncoder": "ComfyUI-WanVideoWrapper",
+    "ImageResizeKJv2": "ComfyUI-KJNodes",
+    "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
+}
+
+OUTPUT_NODE_TYPES = {
+    "SaveImage",
+    "SaveAnimatedWEBP",
+    "SaveAnimatedPNG",
+    "SaveAnimatedGIF",
+    "SaveVideo",
+    "VHS_VideoCombine",
+    "PreviewImage",
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ComfyUI readiness
 # ─────────────────────────────────────────────────────────────────────────────
 _comfy_ready = False
+_object_info_cache = None
 
 def wait_for_comfy():
     global _comfy_ready
@@ -67,8 +92,109 @@ def comfy_get(path):
     r.raise_for_status()
     return r.json()
 
+def get_object_info():
+    global _object_info_cache
+    if _object_info_cache is None:
+        _object_info_cache = comfy_get("/object_info")
+    return _object_info_cache
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Image upload  (BUG 5 FIX)
+# Generic workflow helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def deep_walk(obj):
+    """Yield every string contained in a nested dict/list structure."""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from deep_walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from deep_walk(v)
+    elif isinstance(obj, str):
+        yield obj
+
+def recursive_replace(obj, replacements):
+    """
+    Recursively replace placeholder strings inside a nested workflow object.
+    Works for dict, list, and string values.
+    """
+    if isinstance(obj, dict):
+        return {k: recursive_replace(v, replacements) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [recursive_replace(v, replacements) for v in obj]
+    if isinstance(obj, str):
+        out = obj
+        for old, new in replacements.items():
+            if old in out:
+                out = out.replace(old, new)
+        return out
+    return obj
+
+def workflow_class_types(workflow):
+    classes = []
+    for node_id, node in workflow.items():
+        if isinstance(node, dict) and "class_type" in node:
+            classes.append(node["class_type"])
+    return classes
+
+def workflow_has_output_node(workflow):
+    for node in workflow.values():
+        if isinstance(node, dict) and node.get("class_type") in OUTPUT_NODE_TYPES:
+            return True
+    return False
+
+def validate_workflow(workflow):
+    if not isinstance(workflow, dict):
+        raise ValueError("Workflow must be a dict of ComfyUI nodes.")
+
+    if not workflow_has_output_node(workflow):
+        present = sorted(set(workflow_class_types(workflow)))
+        raise RuntimeError(
+            "Workflow has no output node. Add one of: "
+            + ", ".join(sorted(OUTPUT_NODE_TYPES))
+            + ".\nPresent node types: "
+            + ", ".join(present)
+        )
+
+    object_info = get_object_info()
+    installed = set(object_info.keys())
+    missing = []
+    for cls in sorted(set(workflow_class_types(workflow))):
+        if cls not in installed:
+            missing.append(cls)
+
+    if missing:
+        hinted = []
+        for cls in missing:
+            pack = NODE_PACK_HINTS.get(cls)
+            if pack:
+                hinted.append(f"{cls} -> install {pack}")
+            else:
+                hinted.append(cls)
+        raise RuntimeError(
+            "Missing custom node type(s) in ComfyUI:\n- "
+            + "\n- ".join(hinted)
+        )
+
+def patch_workflow_inputs(workflow, uploaded_filename=None, prompt=None, negative_prompt=None):
+    """
+    Replace placeholders anywhere inside the workflow.
+    """
+    replacements = {}
+
+    if uploaded_filename:
+        replacements["__INPUT_IMAGE__.png"] = uploaded_filename
+        replacements["__INPUT_IMAGE__"] = uploaded_filename
+
+    if prompt is not None:
+        replacements["__PROMPT__"] = prompt
+
+    if negative_prompt is not None:
+        replacements["__NEG_PROMPT__"] = negative_prompt
+
+    return recursive_replace(workflow, replacements)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image upload
 # ─────────────────────────────────────────────────────────────────────────────
 def upload_images_to_comfy(images):
     """
@@ -77,9 +203,9 @@ def upload_images_to_comfy(images):
     """
     uploaded = []
     for img in images:
-        name  = img["name"]
-        b64   = img["image"]
-        if "," in b64:                     # strip data-URI prefix if present
+        name = img["name"]
+        b64 = img["image"]
+        if "," in b64:
             b64 = b64.split(",", 1)[1]
         image_bytes = base64.b64decode(b64)
         resp = requests.post(
@@ -94,24 +220,6 @@ def upload_images_to_comfy(images):
         stored_name = result.get("name", name)
         uploaded.append(stored_name)
     return uploaded
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Workflow patching  (BUG 5 FIX)
-# ─────────────────────────────────────────────────────────────────────────────
-def patch_workflow_image(workflow, uploaded_filename):
-    """
-    Walk the workflow nodes and replace the __INPUT_IMAGE__ placeholder
-    in any LoadImage node with the actual uploaded filename.
-    """
-    for node_id, node in workflow.items():
-        if not isinstance(node, dict):
-            continue
-        if node.get("class_type") == "LoadImage":
-            inputs = node.get("inputs", {})
-            for k, v in inputs.items():
-                if isinstance(v, str) and "__INPUT_IMAGE__" in v:
-                    inputs[k] = uploaded_filename
-    return workflow
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompt submission + history polling
@@ -134,56 +242,41 @@ def wait_for_history(prompt_id, poll_interval=1.0, timeout=600):
     raise RuntimeError(f"Prompt {prompt_id} did not finish within {timeout}s")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Output extraction  (BUG 1 FIX)
+# Output extraction
 # ─────────────────────────────────────────────────────────────────────────────
 def find_output_dir():
     for d in COMFY_OUTPUT_DIRS:
         if os.path.isdir(d):
             return d
-    return COMFY_OUTPUT_DIRS[0]  # fallback — may not exist yet
+    return COMFY_OUTPUT_DIRS[0]
 
 def extract_outputs(history):
     """
     Pull all image/video files out of the ComfyUI history object.
     Returns a list of dicts: [{filename, type, data}]
-    matching the standard worker-comfyui v5+ output format.
     """
     outputs = []
     output_dir = find_output_dir()
 
-    for node_id, node_output in history.get("outputs", {}).items():
-        # Images (still frames, output PNGs)
-        for img in node_output.get("images", []):
-            fname   = img.get("filename", "")
-            subfolder = img.get("subfolder", "")
-            ftype   = img.get("type", "output")
-            if ftype == "temp":           # skip intermediate temp files
-                continue
-            fpath = os.path.join(output_dir, subfolder, fname) if subfolder else os.path.join(output_dir, fname)
-            if not os.path.isfile(fpath):
-                continue
-            with open(fpath, "rb") as f:
-                data = base64.b64encode(f.read()).decode("utf-8")
-            outputs.append({"filename": fname, "type": "base64", "data": data})
-
-        # Videos (VHS_VideoCombine, etc.)
-        for vid in node_output.get("videos", []):
-            fname   = vid.get("filename", "")
-            subfolder = vid.get("subfolder", "")
-            ftype   = vid.get("type", "output")
-            if ftype == "temp":
-                continue
-            fpath = os.path.join(output_dir, subfolder, fname) if subfolder else os.path.join(output_dir, fname)
-            if not os.path.isfile(fpath):
-                continue
-            with open(fpath, "rb") as f:
-                data = base64.b64encode(f.read()).decode("utf-8")
-            outputs.append({"filename": fname, "type": "base64", "data": data})
+    for _, node_output in history.get("outputs", {}).items():
+        for key in ("images", "videos", "gifs"):
+            for item in node_output.get(key, []):
+                fname = item.get("filename", "")
+                subfolder = item.get("subfolder", "")
+                ftype = item.get("type", "output")
+                if ftype == "temp":
+                    continue
+                fpath = os.path.join(output_dir, subfolder, fname) if subfolder else os.path.join(output_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                with open(fpath, "rb") as f:
+                    data = base64.b64encode(f.read()).decode("utf-8")
+                outputs.append({"filename": fname, "type": "base64", "data": data})
 
     return outputs
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Registry helpers (unchanged logic, corrected paths)
+# Registry helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def safe_listdir(path, limit=200):
     try:
@@ -248,9 +341,9 @@ def load_registry():
 # ─────────────────────────────────────────────────────────────────────────────
 def handler(job):
     payload = job.get("input") or {}
-    action  = payload.get("action")
+    action = payload.get("action")
 
-    # ── Utility actions (no ComfyUI needed) ──────────────────────────────────
+    # Utility actions
     if action == "ping":
         return {"status": "ok"}
 
@@ -258,8 +351,8 @@ def handler(job):
         diag = {
             "env": {
                 "LORA_REGISTRY_PATH": os.environ.get("LORA_REGISTRY_PATH"),
-                "COMFY_HOST":         os.environ.get("COMFY_HOST"),
-                "COMFY_PORT":         os.environ.get("COMFY_PORT"),
+                "COMFY_HOST": os.environ.get("COMFY_HOST"),
+                "COMFY_PORT": os.environ.get("COMFY_PORT"),
             },
             "mount_listings": [
                 safe_listdir("/"),
@@ -279,6 +372,10 @@ def handler(job):
         try:
             wait_for_comfy()
             diag["comfy_system_stats"] = comfy_get("/system_stats")
+            try:
+                diag["comfy_object_info_keys"] = sorted(list(get_object_info().keys()))
+            except Exception as e:
+                diag["comfy_object_info_error"] = str(e)
         except Exception as e:
             diag["comfy_system_stats_error"] = str(e)
         return diag
@@ -294,7 +391,7 @@ def handler(job):
         wait_for_comfy()
         return comfy_get("/object_info")
 
-    # ── Main inference path ───────────────────────────────────────────────────
+    # Main inference path
     wait_for_comfy()
 
     workflow = payload.get("workflow") or payload.get("prompt")
@@ -304,30 +401,53 @@ def handler(job):
             "Pass the ComfyUI API-format workflow JSON under input.workflow."
         )
 
-    # Upload input images and patch the workflow (BUG 5 FIX)
+    # Validate before submitting so failures are clearer than HTTP 400
+    validate_workflow(workflow)
+
+    # Images
+    uploaded_filename = None
     images = payload.get("images", [])
     if images:
         uploaded = upload_images_to_comfy(images)
-        # Patch the primary input image into LoadImage nodes
         if uploaded:
-            workflow = patch_workflow_image(workflow, uploaded[0])
+            uploaded_filename = uploaded[0]
 
-    result    = submit_prompt(workflow)
+    # Prompt fields for placeholder-based workflows
+    prompt_text = payload.get("prompt_text", payload.get("prompt", None))
+    negative_text = payload.get("negative_prompt", None)
+
+    # If placeholders exist but values were not provided, tell the user early
+    workflow_strings = "\n".join(deep_walk(workflow))
+    if "__PROMPT__" in workflow_strings and prompt_text is None:
+        raise ValueError("Workflow contains __PROMPT__ but payload.prompt (or prompt_text) was not provided.")
+    if "__NEG_PROMPT__" in workflow_strings and negative_text is None:
+        raise ValueError("Workflow contains __NEG_PROMPT__ but payload.negative_prompt was not provided.")
+    if "__INPUT_IMAGE__" in workflow_strings and uploaded_filename is None:
+        raise ValueError("Workflow contains __INPUT_IMAGE__ but no input image was provided in payload.images.")
+
+    # Patch placeholders anywhere in the workflow
+    workflow = patch_workflow_inputs(
+        workflow,
+        uploaded_filename=uploaded_filename,
+        prompt=prompt_text,
+        negative_prompt=negative_text,
+    )
+
+    result = submit_prompt(workflow)
     prompt_id = result.get("prompt_id")
     if not prompt_id:
         raise RuntimeError(f"ComfyUI did not return a prompt_id. Response: {result}")
 
-    history  = wait_for_history(prompt_id)
-    outputs  = extract_outputs(history)            # BUG 1 FIX
+    history = wait_for_history(prompt_id)
+    outputs = extract_outputs(history)
 
     errors = []
     if not outputs:
         errors.append("No output files found after job completed — check ComfyUI logs via action=diag")
 
-    response = {"images": outputs}
+    response = {"images": outputs, "prompt_id": prompt_id}
     if errors:
         response["errors"] = errors
     return response
-
 
 runpod.serverless.start({"handler": handler})
