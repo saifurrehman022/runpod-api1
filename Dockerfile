@@ -1,6 +1,5 @@
 # FORCE_CLEAN_BUILD_2026_01_12_B
 
-
 # Build argument for base image selection
 ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
@@ -34,7 +33,6 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
-
 
 RUN apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
@@ -81,11 +79,36 @@ ENV COMFYUI_DIR=/comfyui/ComfyUI
 # Put extra model paths where ComfyUI will actually read it
 ADD src/extra_model_paths.yaml /comfyui/ComfyUI/extra_model_paths.yaml
 
-# Go back to the root
-WORKDIR /
-
 # Install Python runtime dependencies for the handler
 RUN /opt/venv/bin/python -m pip install runpod requests websocket-client
+
+# ------------------------------------------------------------
+# Custom nodes required by the WAN I2V workflow
+# ------------------------------------------------------------
+RUN mkdir -p /comfyui/custom_nodes
+
+# WAN wrapper: provides WanVideoModelLoader, WanVideoEncode, WanVideoDecode,
+# WanVideoSampler, WanVideoSLG, WanVideoEasyCache, WanVideoExperimentalArgs,
+# WanVideoTextEncode, WanVideoTextEmbedBridge, WanVideoVAELoader, etc.
+RUN cd /comfyui/custom_nodes && \
+    git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git && \
+    if [ -f /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
+      /opt/venv/bin/python -m pip install -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
+    fi
+
+# KJNodes: provides ImageResizeKJv2
+RUN cd /comfyui/custom_nodes && \
+    git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
+    if [ -f /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
+      /opt/venv/bin/python -m pip install -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
+    fi
+
+# VideoHelperSuite: provides VHS_VideoCombine
+RUN cd /comfyui/custom_nodes && \
+    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git && \
+    if [ -f /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
+      /opt/venv/bin/python -m pip install -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
+    fi
 
 # Add application code and scripts
 ADD src/start.sh src/network_volume.py src/handler.py ./
@@ -103,6 +126,3 @@ RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
 # RunPod Serverless entrypoint
 ENTRYPOINT ["/bin/bash", "/start.sh"]
-
-
-
