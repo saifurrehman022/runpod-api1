@@ -105,10 +105,16 @@ RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 # WanVideoWrapper: provides WanVideoModelLoader, WanVideoSampler, WanVideoEncode,
 # WanVideoVAELoader, WanVideoImageClipEncode, WanVideoTextEmbedBridge,
 # WanVideoExperimentalArgs, WanVideoCacheArgs, WanVideoSLGArgs
-RUN comfy-node-install ComfyUI-WanVideoWrapper
+# Install custom nodes directly via git (bypasses comfy-node-install script)
+RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git \
+    /comfyui/custom_nodes/ComfyUI-WanVideoWrapper \
+    && /comfyui/.venv/bin/pip install -r \
+    /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt
 
-# VideoHelperSuite: provides VHS_VideoCombine (output node in the workflow)
-RUN comfy-node-install comfyui-videohelpersuite
+RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
+    /comfyui/custom_nodes/ComfyUI-VideoHelperSuite \
+    && /comfyui/.venv/bin/pip install -r \
+    /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
 
 # RunPod Serverless entrypoint
 ENTRYPOINT ["/bin/bash", "/start.sh"]
