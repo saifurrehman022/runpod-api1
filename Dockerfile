@@ -42,7 +42,7 @@ RUN wget -qO- https://astral.sh/uv/install.sh | sh \
     && ln -s /root/.local/bin/uvx /usr/local/bin/uvx \
     && uv venv /opt/venv
 
-
+# Use the virtual environment for all subsequent commands
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # CRITICAL FIX: ensure pip exists inside the venv (comfy-cli requires it)
@@ -55,22 +55,22 @@ RUN /opt/venv/bin/python -m pip install comfy-cli
 # Install ComfyUI
 RUN set -eux; \
     if [ -n "${CUDA_VERSION_FOR_COMFY:-}" ]; then \
-      if [ -n "${COMFYUI_VERSION:-}" ]; then \
-        /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --cuda-version "${CUDA_VERSION_FOR_COMFY}" --nvidia; \
-      else \
-        /usr/bin/yes | comfy --workspace /comfyui install --cuda-version "${CUDA_VERSION_FOR_COMFY}" --nvidia; \
-      fi; \
+        if [ -n "${COMFYUI_VERSION:-}" ]; then \
+            /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --cuda-version "${CUDA_VERSION_FOR_COMFY}" --nvidia; \
+        else \
+            /usr/bin/yes | comfy --workspace /comfyui install --cuda-version "${CUDA_VERSION_FOR_COMFY}" --nvidia; \
+        fi; \
     else \
-      if [ -n "${COMFYUI_VERSION:-}" ]; then \
-        /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --nvidia; \
-      else \
-        /usr/bin/yes | comfy --workspace /comfyui install --nvidia; \
-      fi; \
+        if [ -n "${COMFYUI_VERSION:-}" ]; then \
+            /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --nvidia; \
+        else \
+            /usr/bin/yes | comfy --workspace /comfyui install --nvidia; \
+        fi; \
     fi
 
 # Upgrade PyTorch if needed (for newer CUDA versions)
 RUN if [ "$ENABLE_PYTORCH_UPGRADE" = "true" ]; then \
-      /opt/venv/bin/python -m pip install --force-reinstall torch torchvision torchaudio --index-url ${PYTORCH_INDEX_URL}; \
+    /opt/venv/bin/python -m pip install --force-reinstall torch torchvision torchaudio --index-url ${PYTORCH_INDEX_URL}; \
     fi
 
 # ComfyUI is installed under /comfyui/ComfyUI by comfy-cli
@@ -79,36 +79,11 @@ ENV COMFYUI_DIR=/comfyui/ComfyUI
 # Put extra model paths where ComfyUI will actually read it
 ADD src/extra_model_paths.yaml /comfyui/ComfyUI/extra_model_paths.yaml
 
+# Go back to the root
+WORKDIR /
 
+# Install Python runtime dependencies for the handler
 RUN /opt/venv/bin/python -m pip install runpod requests websocket-client
-
-# ------------------------------------------------------------
-# Custom nodes required by the WAN I2V workflow
-# ------------------------------------------------------------
-RUN mkdir -p /comfyui/custom_nodes
-
-# WAN wrapper: provides WanVideoModelLoader, WanVideoEncode, WanVideoDecode,
-# WanVideoSampler, WanVideoSLG, WanVideoEasyCache, WanVideoExperimentalArgs,
-# WanVideoTextEncode, WanVideoTextEmbedBridge, WanVideoVAELoader, etc.
-RUN cd /comfyui/custom_nodes && \
-    git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
-      /opt/venv/bin/python -m pip install -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
-    fi
-
-# KJNodes: provides ImageResizeKJv2
-RUN cd /comfyui/custom_nodes && \
-    git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
-      /opt/venv/bin/python -m pip install -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
-    fi
-
-# VideoHelperSuite: provides VHS_VideoCombine
-RUN cd /comfyui/custom_nodes && \
-    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
-      /opt/venv/bin/python -m pip install -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
-    fi
 
 # Add application code and scripts
 ADD src/start.sh src/network_volume.py src/handler.py ./
@@ -123,6 +98,17 @@ ENV PIP_NO_INPUT=1
 # Copy helper script to switch Manager network mode at container start
 COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode
+
+# =============================================================================
+# CUSTOM NODES — required by wan_i2v_LOCKED.json workflow
+# =============================================================================
+# WanVideoWrapper: provides WanVideoModelLoader, WanVideoSampler, WanVideoEncode,
+# WanVideoVAELoader, WanVideoImageClipEncode, WanVideoTextEmbedBridge,
+# WanVideoExperimentalArgs, WanVideoCacheArgs, WanVideoSLGArgs
+RUN comfy-node-install ComfyUI-WanVideoWrapper
+
+# VideoHelperSuite: provides VHS_VideoCombine (output node in the workflow)
+RUN comfy-node-install comfyui-videohelpersuite
 
 # RunPod Serverless entrypoint
 ENTRYPOINT ["/bin/bash", "/start.sh"]
