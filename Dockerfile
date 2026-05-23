@@ -106,17 +106,20 @@ RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 # Cleanly clone and compile custom dependencies into the active global venv environment
 RUN mkdir -p /comfyui/custom_nodes
 
+# Pre-install critical system packages directly into ComfyUI's internal venv
+RUN /comfyui/.venv/bin/pip install --no-cache-dir opencv-python-headless accelerate
+
 # 1. ComfyUI-KJNodes
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
-    /opt/venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt
+    /comfyui/.venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt
 
 # 2. ComfyUI-WanVideoWrapper
 RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git /comfyui/custom_nodes/ComfyUI-WanVideoWrapper && \
-    /opt/venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt
+    /comfyui/.venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt
 
 # 3. ComfyUI-VideoHelperSuite
 RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
-    /opt/venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
+    /comfyui/.venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
 
 # RunPod Serverless entrypoint
 ENTRYPOINT ["/bin/bash", "/start.sh"]
