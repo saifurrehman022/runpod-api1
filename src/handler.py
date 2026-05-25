@@ -12,7 +12,7 @@ COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "180"))
 COMFY_READY_POLL = 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Supabase signed upload — output goes here instead of raw base64
+# Supabase signed upload
 # ─────────────────────────────────────────────────────────────────────────────
 SIGNED_UPLOAD_ENDPOINT: str = os.environ.get(
     "SIGNED_UPLOAD_ENDPOINT",
@@ -57,6 +57,7 @@ NODE_PACK_HINTS = {
     "WanVideoExperimentalArgs":     "ComfyUI-WanVideoWrapper",
     "WanVideoTorchCompileSettings": "ComfyUI-WanVideoWrapper",
     "LoadWanVideoT5TextEncoder":    "ComfyUI-WanVideoWrapper",
+    "WanVideoSetBlockSwap":         "ComfyUI-WanVideoWrapper",
     "ImageResizeKJv2":              "ComfyUI-KJNodes",
     "VHS_VideoCombine":             "ComfyUI-VideoHelperSuite",
 }
@@ -169,19 +170,13 @@ def patch_workflow_inputs(workflow, uploaded_filename=None, prompt=None, negativ
     return recursive_replace(workflow, replacements)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW: Download image from URL → upload to ComfyUI
-# Accepts payload keys:  image_url  /  source_url  /  target_url
+# Image input — URL download or base64
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_image_from_url(url: str, filename: str = "input_image.png") -> str:
-    """
-    Download an image from a public URL and upload it to ComfyUI.
-    Returns the filename ComfyUI stored it under.
-    """
     resp = requests.get(url, timeout=60)
     if resp.status_code >= 400:
         raise RuntimeError(f"Failed to download image from {url}: HTTP {resp.status_code}")
     image_bytes = resp.content
-    # Detect extension from Content-Type if possible
     ct = resp.headers.get("Content-Type", "")
     if "jpeg" in ct or "jpg" in ct:
         filename = filename.replace(".png", ".jpg")
@@ -197,30 +192,19 @@ def fetch_image_from_url(url: str, filename: str = "input_image.png") -> str:
         raise RuntimeError(f"ComfyUI upload failed: {upload_resp.text[:500]}")
     return upload_resp.json().get("name", filename)
 
-def resolve_input_image(payload: dict) -> str | None:
-    """
-    Resolve input image from payload — checks URL fields first, then base64 images array.
-    Returns the filename ComfyUI stored it under, or None if no image provided.
-    """
-    # URL-based input (serverless preferred — no base64 bloat)
+def resolve_input_image(payload: dict):
     for key in ("image_url", "source_url", "target_url"):
         url = payload.get(key)
         if url:
             filename = f"{key.replace('_url','')}_image.png"
             return fetch_image_from_url(url, filename)
-
-    # Fallback: base64 images array (old format still supported)
     images = payload.get("images", [])
     if images:
         uploaded = upload_images_to_comfy(images)
         if uploaded:
             return uploaded[0]
-
     return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Base64 image upload (legacy support)
-# ─────────────────────────────────────────────────────────────────────────────
 def upload_images_to_comfy(images):
     uploaded = []
     for img in images:
@@ -261,7 +245,7 @@ def wait_for_history(prompt_id, poll_interval=1.0, timeout=600):
     raise RuntimeError(f"Prompt {prompt_id} did not finish within {timeout}s")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Output extraction
+# Output — stream directly from disk to Supabase (NO base64 in memory)
 # ─────────────────────────────────────────────────────────────────────────────
 def find_output_dir():
     for d in COMFY_OUTPUT_DIRS:
@@ -269,9 +253,10 @@ def find_output_dir():
             return d
     return COMFY_OUTPUT_DIRS[0]
 
-def extract_outputs(history):
-    outputs = []
+def get_output_filepaths(history):
+    """Return list of {filename, filepath} from ComfyUI history — no base64."""
     output_dir = find_output_dir()
+    files = []
     for _, node_output in history.get("outputs", {}).items():
         for key in ("images", "videos", "gifs"):
             for item in node_output.get(key, []):
@@ -280,74 +265,69 @@ def extract_outputs(history):
                 fname     = item.get("filename", "")
                 subfolder = item.get("subfolder", "")
                 fpath = os.path.join(output_dir, subfolder, fname) if subfolder else os.path.join(output_dir, fname)
-                if not os.path.isfile(fpath):
-                    continue
-                with open(fpath, "rb") as f:
-                    data = base64.b64encode(f.read()).decode("utf-8")
-                outputs.append({"filename": fname, "type": "base64", "data": data})
-    return outputs
+                if os.path.isfile(fpath):
+                    files.append({"filename": fname, "filepath": fpath})
+    return files
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW: Upload output file to Supabase signed endpoint
-# Returns the public URL of the uploaded file.
-# ─────────────────────────────────────────────────────────────────────────────
-def upload_output_to_supabase(filename: str, file_bytes: bytes) -> str:
+def upload_output_to_supabase(filename: str, filepath: str) -> str:
     """
-    POST the output file to the Supabase signed upload edge function.
-    The function handles signing and storage, returns a public URL.
+    Stream file DIRECTLY from disk to Supabase — no base64, no memory bloat.
+    timeout=300s (5 minutes) instead of the old broken 120s.
     """
-    resp = requests.post(
-        SIGNED_UPLOAD_ENDPOINT,
-        headers={
-            "Authorization": f"Bearer {RUNPOD_UPLOAD_SECRET}",
-            "x-filename": filename,
-        },
-        data=file_bytes,
-        timeout=6000,
-    )
+    file_size = os.path.getsize(filepath)
+    print(f"Uploading {filename} ({file_size/1024/1024:.1f}MB) to Supabase...")
+    with open(filepath, "rb") as f:
+        resp = requests.post(
+            SIGNED_UPLOAD_ENDPOINT,
+            headers={
+                "Authorization": f"Bearer {RUNPOD_UPLOAD_SECRET}",
+                "x-filename": filename,
+                "Content-Type": "video/mp4",
+                "Content-Length": str(file_size),
+            },
+            data=f,       # stream directly from file handle — no memory bloat
+            timeout=300,  # 5 minutes
+        )
     if resp.status_code >= 400:
         raise RuntimeError(
             f"Supabase upload failed for {filename}: "
             f"HTTP {resp.status_code} | {resp.text[:500]}"
         )
     result = resp.json()
-    # Edge function should return { "url": "https://..." }
     url = result.get("url") or result.get("publicUrl") or result.get("public_url")
     if not url:
-        raise RuntimeError(
-            f"Supabase upload response missing URL field. Got: {result}"
-        )
+        raise RuntimeError(f"Supabase response missing URL. Got: {result}")
+    print(f"Upload success: {url}")
     return url
 
 def extract_and_upload_outputs(history) -> list:
     """
-    Extract output files from ComfyUI history, upload each to Supabase,
-    return list of { filename, url } dicts.
-    Falls back to base64 if upload fails (so jobs don't silently die).
+    Stream each output file from disk directly to Supabase.
+    Returns [{filename, type, url}].
+    Falls back to base64 only if upload fails so job never dies silently.
     """
-    raw_outputs = extract_outputs(history)
+    output_files = get_output_filepaths(history)
     results = []
-    output_dir = find_output_dir()
-
-    for item in raw_outputs:
+    for item in output_files:
         fname = item["filename"]
-        # Decode the base64 we already have
-        file_bytes = base64.b64decode(item["data"])
+        fpath = item["filepath"]
         try:
-            url = upload_output_to_supabase(fname, file_bytes)
+            url = upload_output_to_supabase(fname, fpath)
             results.append({"filename": fname, "type": "url", "url": url})
         except Exception as e:
-            # Fallback to base64 so the job still returns something
+            print(f"Upload failed for {fname}: {e} — falling back to base64")
+            with open(fpath, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
             results.append({
                 "filename": fname,
                 "type": "base64",
-                "data": item["data"],
+                "data": b64,
                 "upload_error": str(e),
             })
     return results
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Registry helpers (unchanged)
+# Registry helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def safe_listdir(path, limit=200):
     try:
@@ -412,9 +392,9 @@ def handler(job):
     if action == "diag":
         diag = {
             "env": {
-                "LORA_REGISTRY_PATH":    os.environ.get("LORA_REGISTRY_PATH"),
-                "COMFY_HOST":            os.environ.get("COMFY_HOST"),
-                "COMFY_PORT":            os.environ.get("COMFY_PORT"),
+                "LORA_REGISTRY_PATH":     os.environ.get("LORA_REGISTRY_PATH"),
+                "COMFY_HOST":             os.environ.get("COMFY_HOST"),
+                "COMFY_PORT":             os.environ.get("COMFY_PORT"),
                 "SIGNED_UPLOAD_ENDPOINT": SIGNED_UPLOAD_ENDPOINT,
             },
             "mount_listings": [
@@ -459,14 +439,11 @@ def handler(job):
 
     validate_workflow(workflow)
 
-    # Resolve input image — URL (preferred) or base64
     uploaded_filename = resolve_input_image(payload)
 
-    # Text prompts
     prompt_text   = payload.get("prompt_text") or payload.get("prompt")
     negative_text = payload.get("negative_prompt")
 
-    # Early validation of placeholders
     workflow_strings = "\n".join(deep_walk(workflow))
     if "__PROMPT__" in workflow_strings and not prompt_text:
         raise ValueError("Workflow has __PROMPT__ but no prompt_text provided.")
@@ -488,8 +465,6 @@ def handler(job):
         raise RuntimeError(f"No prompt_id from ComfyUI: {result}")
 
     history = wait_for_history(prompt_id)
-
-    # Upload outputs to Supabase, get back URLs
     outputs = extract_and_upload_outputs(history)
 
     response = {"outputs": outputs, "prompt_id": prompt_id}
