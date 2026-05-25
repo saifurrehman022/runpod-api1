@@ -303,7 +303,7 @@ def upload_output_to_supabase(filename: str, file_bytes: bytes) -> str:
             "x-filename": filename,
         },
         data=file_bytes,
-        timeout=120,
+        timeout=6000,
     )
     if resp.status_code >= 400:
         raise RuntimeError(
