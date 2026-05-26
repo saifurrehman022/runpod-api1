@@ -233,7 +233,7 @@ def submit_prompt(prompt):
         raise RuntimeError(f"ComfyUI /prompt failed: HTTP {r.status_code} | {r.text[:4000]}")
     return r.json()
 
-def wait_for_history(prompt_id, poll_interval=1.0, timeout=600):
+def wait_for_history(prompt_id, poll_interval=1.0, timeout=60000):
     start = time.time()
     while time.time() - start < timeout:
         r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=30)
