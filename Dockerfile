@@ -130,26 +130,8 @@ RUN git clone https://github.com/IAMCCS/IAMCCS-nodes /comfyui/custom_nodes/IAMCC
 
 
 
-# 4. Core WanVideo Wrapper (Handles SVI via LoRA weights)
-RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper /comfyui/custom_nodes/ComfyUI-WanVideoWrapper && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
-        pip3 install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
-    fi
 
-# 5. Utility nodes (pinned commits for reproducibility)
-RUN git clone https://github.com/kijai/ComfyUI-KJNodes /comfyui/custom_nodes/ComfyUI-KJNodes \
-    && cd /comfyui/custom_nodes/ComfyUI-KJNodes \
-    && (git checkout 79f529a84a8c20fe5dcdfa984c6be7a94102c014 2>/dev/null || \
-        (git fetch origin 79f529a84a8c20fe5dcdfa984c6be7a94102c014 --depth=1 \
-         && git checkout 79f529a84a8c20fe5dcdfa984c6be7a94102c014) || \
-        echo "WARN: falling back to default branch HEAD")
 
-RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /comfyui/custom_nodes/ComfyUI-VideoHelperSuite \
-    && cd /comfyui/custom_nodes/ComfyUI-VideoHelperSuite \
-    && (git checkout 8550981384301e9bc5bfea83e5c2c75258102593 2>/dev/null || \
-        (git fetch origin 8550981384301e9bc5bfea83e5c2c75258102593 --depth=1 \
-         && git checkout 8550981384301e9bc5bfea83e5c2c75258102593) || \
-        echo "WARN: falling back to default branch HEAD")
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do comfy model download --url 'https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors' --relative-path models/loras --filename 'wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
 
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do comfy model download --url 'https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Wan22_Lightx2v/Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_v1030_rank_64_bf16.safetensors' --relative-path models/loras --filename 'Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_v1030_rank_64_bf16.safetensors' && break; if [ $i -eq 5 ]; then echo "model-download failed after 5 attempts" >&2; exit 1; fi; SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i) && echo "model-download attempt $i failed; retrying in $SLEEP seconds" >&2; sleep $SLEEP; done
