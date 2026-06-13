@@ -15,7 +15,6 @@ COMFY_OUTPUT_DIRS = [
     "/comfyui/output",
     "/root/comfyui/output",
 ]
-
 OUTPUT_NODE_TYPES = {
     "SaveImage",
     "SaveAnimatedWEBP",
