@@ -106,22 +106,37 @@ RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 # =============================================================================
 RUN mkdir -p /comfyui/custom_nodes
 
-# Step 1: Install critical system packages directly into ComfyUI's internal runtime venv
-RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir opencv-python-headless accelerate
+# 1. Base Core Upgrades
+RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Step 2: Clone and install KJNodes (Provides SVI Extender Stage 1)
+# 2. Complete Exhaustive Web-Verified Pre-Reqs for WanVideo, SVI (KJNodes), & VideoHelperSuite
+RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
+    opencv-python-headless \
+    imageio-ffmpeg \
+    accelerate \
+    diffusers \
+    peft \
+    einops \
+    sentencepiece \
+    protobuf \
+    pyloudnorm \
+    gguf \
+    ftfy \
+    color-matcher \
+    matplotlib \
+    mss
+
+# 3. Clone Nodes & Execute Automatic Internal Checks
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
     if [ -f /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
     fi
 
-# Step 3: Clone and install VideoHelperSuite (Provides video management)
 RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
     if [ -f /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
     fi
 
-# Step 4: Clone and install WanVideoWrapper
 RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git /comfyui/custom_nodes/ComfyUI-WanVideoWrapper && \
     if [ -f /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
