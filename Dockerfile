@@ -185,7 +185,6 @@ RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
     if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
     SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
 
-# VAE
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
     comfy --workspace /comfyui model download \
       --url 'https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors' \
@@ -194,7 +193,6 @@ RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
     if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
     SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
 
-# Diffusion models (HIGH and LOW — both mapped from same source for now)
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
     comfy --workspace /comfyui model download \
       --url 'https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_14B_fp8_e4m3fn.safetensors' \
@@ -211,11 +209,10 @@ RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
     if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
     SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
 
-# Input directory and default image
+
 RUN mkdir -p /comfyui/input
 RUN wget --progress=dot:giga \
     -O '/comfyui/input/Gemini_Generated_Image_jk7o1njk7o1njk7o.png' \
     "https://cool-anteater-319.convex.cloud/api/storage/0c172877-f42a-4fa0-89ea-d40d82991fa6"
 
-# RunPod Serverless entrypoint
 ENTRYPOINT ["/bin/bash", "/start.sh"]
