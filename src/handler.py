@@ -8,7 +8,7 @@ import runpod
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
-COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "180"))
+COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "1800000"))
 COMFY_READY_POLL = 1.0
 
 COMFY_OUTPUT_DIRS = [
@@ -27,23 +27,7 @@ OUTPUT_NODE_TYPES = {
     "PreviewImage",
 }
 
-NODE_PACK_HINTS = {
-    "ImageResizeKJv2": "ComfyUI-KJNodes",
-    "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
-    "DiffusionModelLoaderKJ": "ComfyUI-KJNodes",
-    "CLIPLoader": "core",
-    "VAELoader": "core",
-    "LoraLoaderModelOnly": "core",
-    "BasicScheduler": "core",
-    "SplitSigmas": "core",
-    "KSamplerSelect": "core",
-    "RandomNoise": "core",
-    "VAEEncode": "core",
-    "LoadImage": "core",
-}
-
 _comfy_ready = False
-_object_info_cache = None
 
 
 def wait_for_comfy():
@@ -72,13 +56,6 @@ def comfy_get(path):
     r = requests.get(f"{COMFY_BASE}{path}", timeout=30)
     r.raise_for_status()
     return r.json()
-
-
-def get_object_info():
-    global _object_info_cache
-    if _object_info_cache is None:
-        _object_info_cache = comfy_get("/object_info")
-    return _object_info_cache
 
 
 def deep_walk(obj):
@@ -132,16 +109,6 @@ def validate_workflow(workflow):
             + ", ".join(sorted(OUTPUT_NODE_TYPES))
             + ". Present: " + ", ".join(present)
         )
-
-    installed = set(get_object_info().keys())
-    missing = [cls for cls in sorted(set(workflow_class_types(workflow))) if cls not in installed]
-    if missing:
-        hinted = [
-            f"{cls} -> install {NODE_PACK_HINTS[cls]}"
-            if cls in NODE_PACK_HINTS else cls
-            for cls in missing
-        ]
-        raise RuntimeError("Missing custom node type(s):\n- " + "\n- ".join(hinted))
 
 
 def patch_workflow_inputs(workflow, uploaded_filename=None, prompt=None, negative_prompt=None):
@@ -295,10 +262,6 @@ def handler(job):
     if action == "comfy_system_stats":
         wait_for_comfy()
         return comfy_get("/system_stats")
-
-    if action == "comfy_object_info":
-        wait_for_comfy()
-        return comfy_get("/object_info")
 
     wait_for_comfy()
 
