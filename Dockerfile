@@ -114,7 +114,9 @@ RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     ftfy \
     color-matcher \
     matplotlib \
-    mss
+    mss \
+    onnxruntime-gpu \
+    transformers
 
 # KJNodes — required by WanVideoWrapper for DiffusionModelLoaderKJ, ImageResizeKJv2, etc.
 RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
