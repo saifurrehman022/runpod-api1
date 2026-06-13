@@ -161,7 +161,10 @@ RUN git clone --depth 1 https://github.com/theUpsider/ComfyUI-Logic.git /comfyui
     if [ -f /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt; \
     fi
-
+RUN git clone --depth 1 https://github.com/Well-Made/ComfyUI-Wan-SVI2Pro-FLF.git /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF && \
+    if [ -f /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt; \
+    fi
 # =============================================================================
 # 7. MODEL DOWNLOAD LAYER (WITH RE-TRY BACKOFF LOOP STRATEGY)
 # =============================================================================
