@@ -111,23 +111,11 @@ RUN /comfyui/.venv/bin/pip install --no-cache-dir opencv-python-headless acceler
 RUN /comfyui/.venv/bin/pip install --force-reinstall \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
-# 1. ComfyUI-KJNodes
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
-    /comfyui/.venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt
+    /opt/venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt
 
-# 2. ComfyUI-WanVideoWrapper
-RUN git clone https://github.com/kijai/ComfyUI-WanVideoWrapper.git /comfyui/custom_nodes/ComfyUI-WanVideoWrapper && \
-    /comfyui/.venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt
-
-# 3. ComfyUI-VideoHelperSuite
 RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
-    /comfyui/.venv/bin/pip install -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
-# 2. IAMCCS custom nodes installed globally
-RUN git clone https://github.com/IAMCCS/IAMCCS-nodes /comfyui/custom_nodes/IAMCCS-nodes && \
-    if [ -f /comfyui/custom_nodes/IAMCCS-nodes/requirements.txt ]; then \
-        pip3 install --no-cache-dir -r /comfyui/custom_nodes/IAMCCS-nodes/requirements.txt; \
-    fi
-
+    /opt/venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
 
 
 
