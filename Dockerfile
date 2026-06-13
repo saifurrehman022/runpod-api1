@@ -134,7 +134,11 @@ RUN git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git /co
     if [ -f /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
     fi
-
+# FIX: Clone the Logic suite to provide the missing 'SetNode' primitive
+RUN git clone https://github.com/theUpsider/ComfyUI-Logic.git /comfyui/custom_nodes/ComfyUI-Logic && \
+    if [ -f /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt; \
+    fi
 # =============================================================================
 # MODELS
 # =============================================================================
