@@ -111,6 +111,7 @@ RUN /comfyui/.venv/bin/pip install --no-cache-dir opencv-python-headless acceler
 RUN /comfyui/.venv/bin/pip install --force-reinstall \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
+    
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
     /opt/venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt
 
