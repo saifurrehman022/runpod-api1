@@ -10,6 +10,9 @@ COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "1800"))
 COMFY_READY_POLL = 1.0
+
+DEFAULT_WORKFLOW_PATH = "/workflow.json"
+
 COMFY_OUTPUT_DIRS = [
     "/comfyui/output",
     "/comfyui/ComfyUI/output",
@@ -53,15 +56,102 @@ def comfy_get(path):
     return r.json()
 
 
-def deep_walk(obj):
-    if isinstance(obj, dict):
-        for v in obj.values():
-            yield from deep_walk(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from deep_walk(v)
-    elif isinstance(obj, str):
-        yield obj
+def load_default_workflow():
+    with open(DEFAULT_WORKFLOW_PATH) as f:
+        return json.load(f)
+
+
+def resolve_set_get_nodes(workflow):
+    """
+    Flatten SetNode/GetNode pairs into direct node links.
+    KJNodes' SetNode/GetNode are frontend-only in newer versions and
+    will be rejected by ComfyUI's backend prompt validator.
+    """
+    # Build variable name -> source [node_id, slot] map from SetNodes
+    sets = {}
+    set_ids = set()
+    get_ids = set()
+
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        ct = node.get("class_type", "")
+        if ct == "SetNode":
+            set_ids.add(node_id)
+            key = node.get("inputs", {}).get("widget_0")
+            if key:
+                for k, v in node.get("inputs", {}).items():
+                    if k != "widget_0" and isinstance(v, list) and len(v) == 2:
+                        sets[key] = v
+                        break
+        elif ct == "GetNode":
+            get_ids.add(node_id)
+
+    if not set_ids and not get_ids:
+        return workflow  # nothing to do
+
+    # Build GetNode id -> resolved source map
+    get_output = {}
+    for node_id, node in workflow.items():
+        if node_id in get_ids:
+            key = node.get("inputs", {}).get("widget_0")
+            if key and key in sets:
+                get_output[node_id] = sets[key]
+
+    # Rewrite all inputs that reference a GetNode
+    def resolve(val):
+        if isinstance(val, list) and len(val) == 2:
+            ref_id = str(val[0])
+            slot = val[1]
+            if ref_id in get_output and slot == 0:
+                return get_output[ref_id]
+        return val
+
+    new_wf = {}
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            new_wf[node_id] = node
+            continue
+        if node.get("class_type") in ("SetNode", "GetNode"):
+            continue
+        new_node = dict(node)
+        new_inputs = {k: resolve(v) for k, v in node.get("inputs", {}).items()}
+        new_node["inputs"] = new_inputs
+        new_wf[node_id] = new_node
+
+    return new_wf
+
+
+def fix_vhs_video_combine(workflow):
+    """
+    API-format export of VHS_VideoCombine has broken inputs (widget names
+    as slot keys instead of node link arrays). Rebuild it correctly.
+    """
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") != "VHS_VideoCombine":
+            continue
+        inputs = node.get("inputs", {})
+        broken_keys = {"audio", "meta_batch", "vae", "widget_0", "widget_1",
+                       "widget_2", "widget_3", "widget_4", "widget_5",
+                       "widget_6", "widget_7"}
+        if broken_keys & set(inputs.keys()):
+            images_link = inputs.get("images")
+            if not isinstance(images_link, list):
+                images_link = ["203", 1]
+            node["inputs"] = {"images": images_link}
+            node["widget_0"] = 16
+            node["widget_1"] = 0
+            node["widget_2"] = "Wan22_SVI_Pro"
+            node["widget_3"] = "video/h264-mp4"
+            node["widget_4"] = "yuv420p"
+            node["widget_5"] = 19
+            node["widget_6"] = True
+            node["widget_7"] = False
+            node["widget_8"] = False
+            node["widget_9"] = True
+    return workflow
 
 
 def recursive_replace(obj, replacements):
@@ -70,12 +160,34 @@ def recursive_replace(obj, replacements):
     if isinstance(obj, list):
         return [recursive_replace(v, replacements) for v in obj]
     if isinstance(obj, str):
-        out = obj
         for old, new in replacements.items():
-            if old in out:
-                out = out.replace(old, new)
-        return out
+            if old in obj:
+                obj = obj.replace(old, new)
+        return obj
     return obj
+
+
+def patch_workflow_inputs(workflow, uploaded_filename=None, prompt=None, negative_prompt=None):
+    # Direct patch on LoadImage node
+    if uploaded_filename:
+        for node_id, node in workflow.items():
+            if isinstance(node, dict) and node.get("class_type") == "LoadImage":
+                node.setdefault("inputs", {})
+                node["inputs"]["widget_0"] = uploaded_filename
+                node["widget_0"] = uploaded_filename
+
+    # String-template replacement
+    replacements = {}
+    if uploaded_filename:
+        replacements["__INPUT_IMAGE__.png"] = uploaded_filename
+        replacements["__INPUT_IMAGE__"] = uploaded_filename
+        replacements["Gemini_Generated_Image_jk7o1njk7o1njk7o.png"] = uploaded_filename
+    if prompt is not None:
+        replacements["__PROMPT__"] = prompt
+    if negative_prompt is not None:
+        replacements["__NEG_PROMPT__"] = negative_prompt
+
+    return recursive_replace(workflow, replacements)
 
 
 def workflow_has_output_node(workflow):
@@ -99,55 +211,6 @@ def validate_workflow(workflow):
             + ", ".join(sorted(OUTPUT_NODE_TYPES))
             + ". Present: " + ", ".join(present)
         )
-
-
-def fix_vhs_video_combine(workflow):
-    """
-    The API-format export of VHS_VideoCombine incorrectly encodes widget values
-    as input slot names (strings) instead of proper node link arrays.
-    This function replaces the broken node with a correctly structured one.
-
-    Correct structure: only 'images' input wired to node 203 slot 1.
-    Widget values go in widget_0..widget_N positional fields.
-    """
-    for node_id, node in workflow.items():
-        if not isinstance(node, dict):
-            continue
-        if node.get("class_type") != "VHS_VideoCombine":
-            continue
-
-        inputs = node.get("inputs", {})
-
-        # Detect the broken pattern: widget names used as input slot keys
-        broken_keys = {"audio", "meta_batch", "vae", "widget_0", "widget_1",
-                       "widget_2", "widget_3", "widget_4", "widget_5",
-                       "widget_6", "widget_7"}
-        if broken_keys & set(inputs.keys()):
-            # Find the images input — should be a [node_id, slot] pair
-            images_link = inputs.get("images")
-            if not isinstance(images_link, list):
-                # Default: wire to node 203, slot 1 (the Extension output images)
-                images_link = ["203", 1]
-
-            node["inputs"] = {
-                "images": images_link,
-                # audio, meta_batch, vae are optional and unconnected
-            }
-            # Correct widget values for VHS_VideoCombine:
-            # frame_rate, loop_count, filename_prefix, format, pix_fmt,
-            # crf, save_metadata, trim_to_audio, pingpong, save_output
-            node["widget_0"] = 16          # frame_rate
-            node["widget_1"] = 0           # loop_count
-            node["widget_2"] = "Wan22_SVI_Pro"  # filename_prefix
-            node["widget_3"] = "video/h264-mp4"  # format
-            node["widget_4"] = "yuv420p"   # pix_fmt
-            node["widget_5"] = 19          # crf
-            node["widget_6"] = True        # save_metadata
-            node["widget_7"] = False       # trim_to_audio
-            node["widget_8"] = False       # pingpong
-            node["widget_9"] = True        # save_output
-
-    return workflow
 
 
 def fetch_image_from_url(url: str, filename: str = "input_image.png") -> str:
@@ -200,33 +263,6 @@ def resolve_input_image(payload: dict):
         if uploaded:
             return uploaded[0]
     return None
-
-
-def patch_workflow_inputs(workflow, uploaded_filename=None, prompt=None, negative_prompt=None):
-    """
-    Inject uploaded image into the LoadImage node (node 97) directly,
-    and also do string-template replacement for __PROMPT__ / __NEG_PROMPT__ / __INPUT_IMAGE__.
-    """
-    # 1. Direct patch: update LoadImage node widget_0 with the actual filename
-    if uploaded_filename:
-        for node_id, node in workflow.items():
-            if isinstance(node, dict) and node.get("class_type") == "LoadImage":
-                node["inputs"] = node.get("inputs", {})
-                node["inputs"]["widget_0"] = uploaded_filename
-                node["widget_0"] = uploaded_filename
-
-    # 2. String-template replacement fallback
-    replacements = {}
-    if uploaded_filename:
-        replacements["__INPUT_IMAGE__.png"] = uploaded_filename
-        replacements["__INPUT_IMAGE__"] = uploaded_filename
-        replacements["Gemini_Generated_Image_jk7o1njk7o1njk7o.png"] = uploaded_filename
-    if prompt is not None:
-        replacements["__PROMPT__"] = prompt
-    if negative_prompt is not None:
-        replacements["__NEG_PROMPT__"] = negative_prompt
-
-    return recursive_replace(workflow, replacements)
 
 
 def submit_prompt(prompt, client_id="runpod"):
@@ -285,13 +321,10 @@ def file_to_base64(filepath):
 
 def extract_outputs_base64(history):
     output_files = get_output_filepaths(history)
-    results = []
-    for item in output_files:
-        results.append({
-            "filename": item["filename"],
-            "base64": file_to_base64(item["filepath"]),
-        })
-    return results
+    return [
+        {"filename": item["filename"], "base64": file_to_base64(item["filepath"])}
+        for item in output_files
+    ]
 
 
 def handler(job):
@@ -308,23 +341,23 @@ def handler(job):
     wait_for_comfy()
 
     workflow = payload.get("workflow") or payload.get("prompt")
-    if not workflow:
-        raise ValueError("Missing 'workflow' in job input.")
-    if isinstance(workflow, str):
-        workflow = json.loads(workflow)
+    if workflow:
+        if isinstance(workflow, str):
+            workflow = json.loads(workflow)
+        # Flatten SetNode/GetNode — they're frontend-only in KJNodes
+        workflow = resolve_set_get_nodes(workflow)
+        # Fix broken VHS_VideoCombine from API export
+        workflow = fix_vhs_video_combine(workflow)
+    else:
+        # Use baked-in pre-resolved workflow
+        workflow = load_default_workflow()
 
     validate_workflow(workflow)
 
-    # Fix broken VHS_VideoCombine inputs from API-format export
-    workflow = fix_vhs_video_combine(workflow)
-
-    # Upload input image if provided
     uploaded_filename = resolve_input_image(payload)
-
     prompt_text = payload.get("prompt_text")
     negative_text = payload.get("negative_prompt")
 
-    # Inject image and text into workflow
     workflow = patch_workflow_inputs(
         workflow,
         uploaded_filename=uploaded_filename,
