@@ -136,7 +136,8 @@ RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     matplotlib \
     mss \
     onnxruntime-gpu \
-    transformers
+    transformers\
+    sageattention
 
 # Step C: Clone Required Custom Nodes and check for internal secondary dependencies
 # Clone KJNodes (Handles core math logic, image transformations, and structural loaders)
