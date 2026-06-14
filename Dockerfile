@@ -1,5 +1,5 @@
 # =============================================================================
-# 1. BASE IMAGE SELECTION & CONFIGURATION
+# 1. BASE IMAGE SELECTION & CONF
 # =============================================================================
 # Selects a bare-bones Ubuntu 24.04 environment pre-configured with CUDA 12.6.3 and cuDNN
 ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
