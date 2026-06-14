@@ -100,6 +100,8 @@ RUN /opt/venv/bin/python -m pip install runpod requests websocket-client
 
 # Add RunPod specific application code, server hooks, and scripts
 ADD src/start.sh src/network_volume.py src/handler.py ./
+# After the ADD src/handler.py line:
+COPY workflows/wan22_SVI_Pro_8_JAN.json/workflow.json
 RUN chmod +x /start.sh
 
 COPY scripts/comfy-node-install.sh /usr/local/bin/comfy-node-install
