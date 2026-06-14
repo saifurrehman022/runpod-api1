@@ -21,23 +21,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # 2. SYSTEM DEPENDENCIES (APT PACKAGES)
 # =============================================================================
 # Installs core Linux utilities and heavy graphics libraries required by OpenCV (cv2) and FFmpeg
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
     git \
     wget \
     curl \
     ca-certificates \
+    build-essential \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender1 \
     ffmpeg \
-    # Create soft symbolic links to establish global aliases for Python 3.12 execution
+    && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
-
 # Clean up apt caches to save space and minimize final Docker image size
 RUN apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
