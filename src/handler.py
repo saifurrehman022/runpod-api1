@@ -10,7 +10,6 @@ COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "1800"))
 COMFY_READY_POLL = 1.0
-
 COMFY_OUTPUT_DIRS = [
     "/comfyui/output",
     "/comfyui/ComfyUI/output",
