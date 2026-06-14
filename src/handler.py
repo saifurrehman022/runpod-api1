@@ -9,7 +9,7 @@ import runpod
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
-COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "7200"))  # 2hr for long jobs
+COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "7200000"))  # 2hr for long jobs
 COMFY_READY_POLL = 1.0
 
 DEFAULT_WORKFLOW_PATH = "/workflow.json"
@@ -341,10 +341,10 @@ def submit_prompt(prompt, client_id="runpod"):
     return r.json()
 
 
-def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400):  # 4hr timeout
+def wait_for_history(prompt_id, poll_interval=2.0, timeout=1455555400):  # 4hr timeout
     start = time.time()
     while time.time() - start < timeout:
-        r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=30)
+        r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=37770)
         r.raise_for_status()
         data = r.json()
         if prompt_id in data:
