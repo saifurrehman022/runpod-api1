@@ -67,7 +67,6 @@ def resolve_set_get_nodes(workflow):
     KJNodes' SetNode/GetNode are frontend-only in newer versions and
     will be rejected by ComfyUI's backend prompt validator.
     """
-    # Build variable name -> source [node_id, slot] map from SetNodes
     sets = {}
     set_ids = set()
     get_ids = set()
@@ -88,9 +87,8 @@ def resolve_set_get_nodes(workflow):
             get_ids.add(node_id)
 
     if not set_ids and not get_ids:
-        return workflow  # nothing to do
+        return workflow
 
-    # Build GetNode id -> resolved source map
     get_output = {}
     for node_id, node in workflow.items():
         if node_id in get_ids:
@@ -98,7 +96,6 @@ def resolve_set_get_nodes(workflow):
             if key and key in sets:
                 get_output[node_id] = sets[key]
 
-    # Rewrite all inputs that reference a GetNode
     def resolve(val):
         if isinstance(val, list) and len(val) == 2:
             ref_id = str(val[0])
@@ -167,8 +164,12 @@ def recursive_replace(obj, replacements):
     return obj
 
 
-def patch_workflow_inputs(workflow, uploaded_filename=None, prompt=None, negative_prompt=None):
-    # Direct patch on LoadImage node
+def patch_workflow_inputs(workflow, uploaded_filename=None, prompt=None, negative_prompt=None, sampling_steps=None):
+    """
+    Patches prompts, images, and step counts into standard top-level nodes 
+    and ComfyUI Group Subgraph (definitions block) arrays.
+    """
+    # 1. Direct patch on standard top-level LoadImage nodes
     if uploaded_filename:
         for node_id, node in workflow.items():
             if isinstance(node, dict) and node.get("class_type") == "LoadImage":
@@ -176,7 +177,44 @@ def patch_workflow_inputs(workflow, uploaded_filename=None, prompt=None, negativ
                 node["inputs"]["widget_0"] = uploaded_filename
                 node["widget_0"] = uploaded_filename
 
-    # String-template replacement
+    # 2. Extract and patch parameters hidden inside ComfyUI Group Nodes (Subgraphs)
+    if isinstance(workflow, dict) and "extra" in workflow and "definitions" in workflow["extra"]:
+        for subgraph_id, subgraph in workflow["extra"]["definitions"].items():
+            if not isinstance(subgraph, dict) or "nodes" not in subgraph:
+                continue
+            for node in subgraph["nodes"]:
+                if not isinstance(node, dict):
+                    continue
+                
+                # Overwrite Positive Prompt Node widgets inside the subgraph definition
+                if node.get("type") == "CLIPTextEncode" and "Positive" in node.get("title", ""):
+                    if "widgets_values" in node and prompt is not None:
+                        node["widgets_values"] = [prompt]
+                        
+                # Overwrite Negative Prompt Node widgets inside the subgraph definition
+                elif node.get("type") == "CLIPTextEncode" and "Negative" in node.get("title", ""):
+                    if "widgets_values" in node and negative_prompt is not None:
+                        node["widgets_values"] = [negative_prompt]
+                        
+                # Overwrite Step Sliders in Subgraph Samplers (looks for integer index under 100)
+                elif "Sampler" in node.get("type", "") and sampling_steps is not None:
+                    if "widgets_values" in node and isinstance(node["widgets_values"], list):
+                        for idx, val in enumerate(node["widgets_values"]):
+                            if isinstance(val, int) and 0 < val < 100:
+                                node["widgets_values"][idx] = int(sampling_steps)
+                                break
+
+    # 3. Target standard top-level KSamplers or Custom WanVideo Sampler steps (Fallback)
+    if isinstance(workflow, dict):
+        for node_id, node in workflow.items():
+            if isinstance(node, dict):
+                ct = node.get("class_type", "")
+                if "KSampler" in ct or "Wan" in ct or "Sampler" in ct:
+                    inputs = node.setdefault("inputs", {})
+                    if "steps" in inputs and sampling_steps is not None:
+                        inputs["steps"] = int(sampling_steps)
+
+    # 4. String-template placeholder replacements across entire dictionary
     replacements = {}
     if uploaded_filename:
         replacements["__INPUT_IMAGE__.png"] = uploaded_filename
@@ -357,12 +395,15 @@ def handler(job):
     uploaded_filename = resolve_input_image(payload)
     prompt_text = payload.get("prompt_text")
     negative_text = payload.get("negative_prompt")
+    sampling_steps = payload.get("sampling_steps")  # Extract steps parameter from request payload
 
+    # Patch fields inside subgraphs and root-level structures
     workflow = patch_workflow_inputs(
         workflow,
         uploaded_filename=uploaded_filename,
         prompt=prompt_text,
         negative_prompt=negative_text,
+        sampling_steps=sampling_steps,
     )
 
     result = submit_prompt(workflow, payload.get("client_id", "runpod"))
