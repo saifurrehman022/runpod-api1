@@ -224,11 +224,10 @@ RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
       --filename 'Wan2_1_VAE_bf16.safetensors' && break; \
     if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
     SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
-
 # --- DIFFUSION MODELS ---
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
     comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_14B_fp8_e4m3fn.safetensors' \
+      --url 'https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors' \
       --relative-path models/diffusion_models \
       --filename 'Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors' && break; \
     if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
@@ -236,7 +235,7 @@ RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
 
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
     comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_14B_fp8_e4m3fn.safetensors' \
+      --url 'https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors' \
       --relative-path models/diffusion_models \
       --filename 'Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors' && break; \
     if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
