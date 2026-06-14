@@ -2,13 +2,14 @@ import os
 import time
 import json
 import base64
+import copy
 import requests
 import runpod
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
-COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "1800"))
+COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "7200"))  # 2hr for long jobs
 COMFY_READY_POLL = 1.0
 
 DEFAULT_WORKFLOW_PATH = "/workflow.json"
@@ -24,8 +25,17 @@ OUTPUT_NODE_TYPES = {
     "SaveAnimatedGIF", "SaveVideo", "VHS_VideoCombine", "PreviewImage",
 }
 
+# Base scene node IDs (3 scenes in the baked workflow)
 SCENE_POSITIVE_NODES = ["193:211", "181:152", "203:222"]
 SCENE_NEGATIVE_NODES = ["193:209", "181:206", "203:220"]
+
+# WanImageToVideoSVIPro node IDs per scene
+SCENE_SVI_NODES = ["193:215", "181:160", "203:219"]
+
+# Max safe frames per scene chunk on A100 80GB
+MAX_FRAMES_PER_SCENE = 257
+DEFAULT_FRAMES_PER_SCENE = 81
+DEFAULT_FPS = 16
 
 _comfy_ready = False
 
@@ -59,28 +69,189 @@ def load_default_workflow():
         return json.load(f)
 
 
+def build_extra_scene(workflow, scene_idx, prev_sampler_node_id,
+                      prev_decode_node_id, prev_overlap_node_id,
+                      frames_per_scene, positive_text, negative_text,
+                      noise_seed=43):
+    """
+    Dynamically add an extra SVI extension scene to the workflow.
+    Clones the pattern from scene 2 (181:xxx nodes) with new IDs.
+    Returns new node IDs: (sampler2_id, decode_id, overlap_id)
+    """
+    prefix = f"EXT{scene_idx}"
+
+    pos_id   = f"{prefix}:pos"
+    neg_id   = f"{prefix}:neg"
+    svi_id   = f"{prefix}:svi"
+    noise_id = f"{prefix}:noise"
+    dnoise_id= f"{prefix}:dnoise"
+    cfg_h_id = f"{prefix}:cfgh"
+    cfg_l_id = f"{prefix}:cfgl"
+    samp1_id = f"{prefix}:samp1"
+    samp2_id = f"{prefix}:samp2"
+    dec_id   = f"{prefix}:dec"
+    ovlp_id  = f"{prefix}:ovlp"
+
+    workflow[pos_id] = {
+        "inputs": {"text": positive_text, "clip": ["84", 0]},
+        "class_type": "CLIPTextEncode",
+        "_meta": {"title": f"Positive Prompt Scene {scene_idx}"}
+    }
+    workflow[neg_id] = {
+        "inputs": {"text": negative_text, "clip": ["84", 0]},
+        "class_type": "CLIPTextEncode",
+        "_meta": {"title": f"Negative Prompt Scene {scene_idx}"}
+    }
+    workflow[noise_id] = {
+        "inputs": {"noise_seed": noise_seed + scene_idx},
+        "class_type": "RandomNoise",
+        "_meta": {"title": "RandomNoise"}
+    }
+    workflow[dnoise_id] = {
+        "inputs": {},
+        "class_type": "DisableNoise",
+        "_meta": {"title": "DisableNoise"}
+    }
+    workflow[svi_id] = {
+        "inputs": {
+            "length": frames_per_scene,
+            "motion_latent_count": 1,
+            "positive": [pos_id, 0],
+            "negative": [neg_id, 0],
+            "anchor_samples": ["135", 0],
+            "prev_samples": [prev_sampler_node_id, 0]
+        },
+        "class_type": "WanImageToVideoSVIPro",
+        "_meta": {"title": "WanImageToVideoSVIPro"}
+    }
+    workflow[cfg_h_id] = {
+        "inputs": {"cfg": 1, "start_percent": 0, "end_percent": 1,
+                   "model": ["141", 0], "positive": [svi_id, 0], "negative": [svi_id, 1]},
+        "class_type": "ScheduledCFGGuidance",
+        "_meta": {"title": "ScheduledCFGGuidance HIGH"}
+    }
+    workflow[cfg_l_id] = {
+        "inputs": {"cfg": 1, "start_percent": 0, "end_percent": 1,
+                   "model": ["142", 0], "positive": [svi_id, 0], "negative": [svi_id, 1]},
+        "class_type": "ScheduledCFGGuidance",
+        "_meta": {"title": "ScheduledCFGGuidance LOW"}
+    }
+    workflow[samp1_id] = {
+        "inputs": {"noise": [noise_id, 0], "guider": [cfg_h_id, 0],
+                   "sampler": ["127", 0], "sigmas": ["128", 0],
+                   "latent_image": [svi_id, 2]},
+        "class_type": "SamplerCustomAdvanced",
+        "_meta": {"title": "SamplerCustomAdvanced 1"}
+    }
+    workflow[samp2_id] = {
+        "inputs": {"noise": [dnoise_id, 0], "guider": [cfg_l_id, 0],
+                   "sampler": ["127", 0], "sigmas": ["128", 1],
+                   "latent_image": [samp1_id, 0]},
+        "class_type": "SamplerCustomAdvanced",
+        "_meta": {"title": "SamplerCustomAdvanced 2"}
+    }
+    workflow[dec_id] = {
+        "inputs": {"samples": [samp2_id, 0], "vae": ["90", 0]},
+        "class_type": "VAEDecode",
+        "_meta": {"title": "VAE Decode"}
+    }
+    workflow[ovlp_id] = {
+        "inputs": {
+            "overlap": 5,
+            "overlap_side": "source",
+            "overlap_mode": "linear_blend",
+            "source_images": [prev_overlap_node_id, 0],
+            "new_images": [dec_id, 0]
+        },
+        "class_type": "ImageBatchExtendWithOverlap",
+        "_meta": {"title": "ImageBatchExtendWithOverlap"}
+    }
+
+    return samp2_id, dec_id, ovlp_id
+
+
 def patch_workflow_inputs(workflow, uploaded_filename=None, prompts=None,
-                          negative_prompt=None, sampling_steps=None):
+                          negative_prompt=None, sampling_steps=None,
+                          frames_per_scene=None, fps=None, num_scenes=None):
+    """
+    Patch all inputs. Dynamically extends scenes beyond 3 if num_scenes > 3.
+
+    frames_per_scene: frames per SVI chunk (max 257 on A100 80GB)
+    num_scenes: total scenes 3-12 (3 are baked, extras added dynamically)
+    fps: output video frame rate
+    """
+    fps = fps or DEFAULT_FPS
+    frames_per_scene = min(int(frames_per_scene or DEFAULT_FRAMES_PER_SCENE), MAX_FRAMES_PER_SCENE)
+    num_scenes = max(3, int(num_scenes or 3))
+
+    default_neg = workflow.get("193:209", {}).get("inputs", {}).get("text", "")
+
+    # 1. Patch LoadImage
     if uploaded_filename:
         for node_id, node in workflow.items():
             if isinstance(node, dict) and node.get("class_type") == "LoadImage":
                 node["inputs"]["image"] = uploaded_filename
 
+    # 2. Patch positive prompts for base 3 scenes
     if prompts:
         for idx, node_id in enumerate(SCENE_POSITIVE_NODES):
             if node_id in workflow:
                 scene_prompt = prompts[min(idx, len(prompts) - 1)]
                 workflow[node_id]["inputs"]["text"] = scene_prompt
 
+    # 3. Patch negative prompt
     if negative_prompt:
         for node_id in SCENE_NEGATIVE_NODES:
             if node_id in workflow:
                 workflow[node_id]["inputs"]["text"] = negative_prompt
 
+    # 4. Patch frames_per_scene on all WanImageToVideoSVIPro nodes
+    for node_id in SCENE_SVI_NODES:
+        if node_id in workflow:
+            workflow[node_id]["inputs"]["length"] = frames_per_scene
+
+    # 5. Patch sampling steps
     if sampling_steps is not None:
         for node_id, node in workflow.items():
             if isinstance(node, dict) and node.get("class_type") == "BasicScheduler":
                 node["inputs"]["steps"] = int(sampling_steps)
+
+    # 6. Dynamically add extra scenes beyond the base 3
+    if num_scenes > 3:
+        # Last sampler output from scene 3
+        prev_sampler = "203:226"
+        prev_decode  = "203:218"
+        prev_overlap = "203:227"
+
+        for extra_idx in range(4, num_scenes + 1):
+            # Determine prompt for this extra scene
+            if prompts:
+                extra_prompt = prompts[min(extra_idx - 1, len(prompts) - 1)]
+            else:
+                extra_prompt = workflow.get("203:222", {}).get("inputs", {}).get("text", "")
+
+            neg = negative_prompt or default_neg
+
+            prev_sampler, prev_decode, prev_overlap = build_extra_scene(
+                workflow,
+                scene_idx=extra_idx,
+                prev_sampler_node_id=prev_sampler,
+                prev_decode_node_id=prev_decode,
+                prev_overlap_node_id=prev_overlap,
+                frames_per_scene=frames_per_scene,
+                positive_text=extra_prompt,
+                negative_text=neg,
+            )
+
+        # Rewire VHS_VideoCombine to new final overlap node
+        for node_id, node in workflow.items():
+            if isinstance(node, dict) and node.get("class_type") == "VHS_VideoCombine":
+                node["inputs"]["images"] = [prev_overlap, 0]
+
+    # 7. Patch FPS in VHS_VideoCombine
+    for node_id, node in workflow.items():
+        if isinstance(node, dict) and node.get("class_type") == "VHS_VideoCombine":
+            node["inputs"]["frame_rate"] = fps
 
     return workflow
 
@@ -170,7 +341,7 @@ def submit_prompt(prompt, client_id="runpod"):
     return r.json()
 
 
-def wait_for_history(prompt_id, poll_interval=2.0, timeout=3600):
+def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400):  # 4hr timeout
     start = time.time()
     while time.time() - start < timeout:
         r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=30)
@@ -247,14 +418,25 @@ def handler(job):
     raw_prompts = payload.get("prompts")
     prompt_text = payload.get("prompt_text") or payload.get("prompt")
     if raw_prompts and isinstance(raw_prompts, list):
-        prompts = raw_prompts[:3]
+        prompts = raw_prompts
     elif prompt_text:
         prompts = [prompt_text]
     else:
         prompts = None
 
-    negative_text = payload.get("negative_prompt")
-    sampling_steps = payload.get("sampling_steps")
+    # Video length params
+    frames_per_scene = payload.get("frames_per_scene", DEFAULT_FRAMES_PER_SCENE)
+    fps              = payload.get("fps", DEFAULT_FPS)
+    num_scenes       = payload.get("num_scenes", 3)
+    sampling_steps   = payload.get("sampling_steps")
+    negative_text    = payload.get("negative_prompt")
+
+    # Compute and log expected duration
+    total_frames = int(frames_per_scene) * int(num_scenes)
+    expected_seconds = total_frames / int(fps)
+    print(f"[handler] scenes={num_scenes} frames/scene={frames_per_scene} "
+          f"fps={fps} => ~{total_frames} frames => ~{expected_seconds:.0f}s "
+          f"({expected_seconds/60:.1f} min)")
 
     workflow = patch_workflow_inputs(
         workflow,
@@ -262,6 +444,9 @@ def handler(job):
         prompts=prompts,
         negative_prompt=negative_text,
         sampling_steps=sampling_steps,
+        frames_per_scene=frames_per_scene,
+        fps=fps,
+        num_scenes=num_scenes,
     )
 
     result = submit_prompt(workflow, payload.get("client_id", "runpod"))
@@ -275,6 +460,8 @@ def handler(job):
     return {
         "prompt_id": prompt_id,
         "outputs": outputs,
+        "expected_duration_seconds": expected_seconds,
+        "total_frames": total_frames,
         "warning": None if outputs else "Job completed but no output files found.",
     }
 
