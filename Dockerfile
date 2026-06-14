@@ -2,7 +2,7 @@
 ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 FROM ${BASE_IMAGE} AS base
 
-# Define build-time variables (passed using --build-arg during build)
+# Define build-time  --build-arg during build)
 ARG COMFYUI_VERSION=
 ARG CUDA_VERSION_FOR_COMFY
 ARG ENABLE_PYTORCH_UPGRADE=false
