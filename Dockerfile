@@ -14,8 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# =============================================================================
-# 2. SYSTEM DEPENDENCIES (APT PACKAGES)
+# ==========================
 # =============================================================================
 # Installs core Linux utilities and heavy graphics libraries required by OpenCV (cv2) and FFmpeg
 RUN apt-get update && apt-get install -y --no-install-recommends \
