@@ -1,5 +1,3 @@
-
-
 import os
 import time
 import json
@@ -16,7 +14,7 @@ COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "1800"))
 
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "https://yaiygjwbtzevjpxncvzu.supabase.co")
-SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhaXlnandidHpldmpweG5jdnp1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTQ2NTA0MiwiZXhwIjoyMDk3MDQxMDQyfQ.ui2Nt6AmAJv8v5XLf2ozumHlBG4BXg7ROIuo80V9UXk")       # paste service_role key in RunPod env vars
+SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhaXlnandidHpldmpweG5jdnp1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTQ2NTA0MiwiZXhwIjoyMDk3MDQxMDQyfQ.ui2Nt6AmAJv8v5XLf2ozumHlBG4BXg7ROIuo80V9UXk")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "videos")
 
 DEFAULT_WORKFLOW_PATH = "/workflow.json"
@@ -204,56 +202,87 @@ def get_output_filepaths(history):
 
 
 def workflow_has_output_node(workflow):
-    return any(
-        isinstance(node, dict) and node.get("class_type") in OUTPUT_NODE_TYPES
-        for node in workflow.values()
-    )
+    # Support structural API format checking
+    if "nodes" in workflow:
+        return any(node.get("type") in OUTPUT_NODE_TYPES for node in workflow["nodes"] if isinstance(node, dict))
+    return any(isinstance(node, dict) and node.get("class_type") in OUTPUT_NODE_TYPES for node in workflow.values())
 
 
 # ===========================================================================
-# WORKFLOW BUILDING
-# Each scene is a FULLY SELF-CONTAINED job — no cross-job node references.
-# Stitching is done by FFmpeg after all scenes complete.
+# DYNAMIC CONTINUOUS WORKFLOW GENERATION
 # ===========================================================================
 
 def build_single_scene_workflow(base_workflow, positive_text, negative_text,
                                  frames_per_scene, sampling_steps,
-                                 uploaded_filename, fps, scene_idx):
+                                 uploaded_filename, fps, scene_idx, last_scene_history=None):
     """
-    Build a completely self-contained single-scene workflow.
-    Uses only scene 1 nodes (193:xxx) — no overlap nodes, no cross-scene refs.
-    Output goes directly from VAEDecode → VHS_VideoCombine.
+    Builds single scene steps while handling continuous dependencies dynamically.
+    Instead of hardcoding 193:xxx prefixes, it finds target functional configurations
+    by checking their true 'class_type' properties.
     """
-    wf = copy.deepcopy(base_workflow)
+    # Convert UI workflow formats to API maps if necessary
+    if "nodes" in base_workflow:
+        api_wf = {}
+        for node in base_workflow["nodes"]:
+            nid = str(node["id"])
+            api_wf[nid] = {
+                "class_type": node["type"],
+                "inputs": {k: v for k, v in node.get("widgets_values", {}).items()} if isinstance(node.get("widgets_values"), dict) else {}
+            }
+        wf = api_wf
+    else:
+        wf = copy.deepcopy(base_workflow)
 
-    # Patch LoadImage
-    if uploaded_filename:
-        for nid, node in wf.items():
-            if isinstance(node, dict) and node.get("class_type") == "LoadImage":
-                node["inputs"]["image"] = uploaded_filename
+    # 1. Update Core Context Parameters
+    for nid, node in wf.items():
+        if not isinstance(node, dict):
+            continue
+        
+        cls = node.get("class_type")
+        
+        # Inject positive prompts dynamically
+        if cls in ("WanTextConditioning", "CLIPTextEncode") and "positive" in str(node.get("_meta", {}).get("title", "")).lower():
+            node["inputs"]["text"] = positive_text
+        elif cls in ("WanTextConditioning", "CLIPTextEncode") and "negative" in str(node.get("_meta", {}).get("title", "")).lower():
+            node["inputs"]["text"] = negative_text
+            
+        # Manage framework sequence configurations
+        if cls == "WanImageToVideoSVIPro":
+            node["inputs"]["length"] = int(frames_per_scene)
+            
+        if cls == "BasicScheduler" and sampling_steps:
+            node["inputs"]["steps"] = int(sampling_steps)
+            
+        if cls == "RandomNoise":
+            node["inputs"]["noise_seed"] = 43 + scene_idx
 
-    # Patch steps
-    if sampling_steps:
-        for nid, node in wf.items():
-            if isinstance(node, dict) and node.get("class_type") == "BasicScheduler":
-                node["inputs"]["steps"] = int(sampling_steps)
+        if cls == "VHS_VideoCombine":
+            node["inputs"]["frame_rate"] = fps
+            node["inputs"]["filename_prefix"] = f"scene_{scene_idx:02d}"
 
-    # Patch scene 1 prompts and frames
-    wf["193:211"]["inputs"]["text"] = positive_text
-    wf["193:209"]["inputs"]["text"] = negative_text
-    wf["193:215"]["inputs"]["length"] = frames_per_scene
-    # Use unique seed per scene
-    wf["189"]["inputs"]["noise_seed"] = 43 + scene_idx
-
-    # Wire VHS directly to scene 1 VAEDecode output (no overlap node needed)
-    wf["204"]["inputs"]["images"] = ["193:217", 0]
-    wf["204"]["inputs"]["frame_rate"] = fps
-    wf["204"]["inputs"]["filename_prefix"] = f"scene_{scene_idx:02d}"
-
-    # Remove all scene 2 and scene 3 nodes — not needed
-    to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
-    for k in to_remove:
-        del wf[k]
+    # 2. Wire continuity pipeline structure 
+    if scene_idx == 1:
+        # Scene 1: Wire up the initial uploaded layout image reference file
+        if uploaded_filename:
+            for nid, node in wf.items():
+                if isinstance(node, dict) and node.get("class_type") == "LoadImage":
+                    node["inputs"]["image"] = uploaded_filename
+    else:
+        # Scenes 2+: Locate the previous generation's output latent or image map tensor nodes
+        if last_scene_history and "outputs" in last_scene_history:
+            # Locate target latent parameters to forward downstream
+            outputs = last_scene_history["outputs"]
+            last_node_id = list(outputs.keys())[0] # Grabs final output generation node target reference
+            
+            for nid, node in wf.items():
+                if isinstance(node, dict) and node.get("class_type") == "GetNode" and node["inputs"].get("value") == "anchor_samples":
+                    # Bypass static loading and point directly into the historical context mapping structure
+                    node["class_type"] = "GetHistoryTensor" # Redirect hook instance tracking properties
+                    node["inputs"] = {
+                        "prompt_id": last_scene_history.get("prompt_id"),
+                        "node_id": last_node_id,
+                        "output_index": 0
+                    }
 
     return wf
 
@@ -263,7 +292,6 @@ def build_single_scene_workflow(base_workflow, positive_text, negative_text,
 # ===========================================================================
 
 def ffmpeg_concat(video_paths: list, output_path: str):
-    """Concatenate video files using FFmpeg — no re-encoding, just stream copy."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         for vp in video_paths:
             f.write(f"file '{os.path.abspath(vp)}'\n")
@@ -307,7 +335,7 @@ def handler(job):
 
     uploaded_filename = resolve_input_image(payload)
 
-    # Prompts
+    # Prompts setup
     raw_prompts = payload.get("prompts")
     prompt_text = payload.get("prompt_text") or payload.get("prompt")
     if raw_prompts and isinstance(raw_prompts, list):
@@ -321,7 +349,7 @@ def handler(job):
     sampling_steps   = payload.get("sampling_steps")
     frames_per_scene = min(int(payload.get("frames_per_scene", DEFAULT_FRAMES_PER_SCENE)), MAX_FRAMES_PER_SCENE)
     fps              = int(payload.get("fps", DEFAULT_FPS))
-    num_scenes       = max(1, int(payload.get("num_scenes", 3)))
+    num_scenes       = max(1, int(payload.get("num_scenes", 10))) # Defaults cleanly to your 10 scenes layout
 
     job_id      = job.get("id", f"job_{int(time.time())}")
     output_dir  = find_output_dir()
@@ -330,13 +358,14 @@ def handler(job):
 
     total_frames  = frames_per_scene * num_scenes
     expected_secs = total_frames / fps
-    print(f"[handler] {num_scenes} scenes x {frames_per_scene} frames @ {fps}fps "
-          f"= {total_frames} frames = {expected_secs:.0f}s ({expected_secs/60:.1f} min)")
+    print(f"[handler] Running consecutive sequence: {num_scenes} scenes.")
 
-    # Run each scene as a fully independent self-contained ComfyUI job
+    last_scene_history = None
+
+    # Iterative Continuous Generation Loop
     for scene_idx in range(1, num_scenes + 1):
         pos_text = prompts[min(scene_idx - 1, len(prompts) - 1)]
-        print(f"[handler] Scene {scene_idx}/{num_scenes}: {pos_text[:60]}")
+        print(f"[handler] Processing Scene {scene_idx}/{num_scenes}...")
 
         wf = build_single_scene_workflow(
             base_workflow,
@@ -347,6 +376,7 @@ def handler(job):
             uploaded_filename=uploaded_filename,
             fps=fps,
             scene_idx=scene_idx,
+            last_scene_history=last_scene_history # Track and inject previous output state
         )
 
         result    = submit_prompt(wf, f"runpod_s{scene_idx}")
@@ -355,8 +385,12 @@ def handler(job):
             raise RuntimeError(f"Scene {scene_idx}: no prompt_id returned")
 
         history = wait_for_history(prompt_id, timeout=14400)
-        files   = get_output_filepaths(history)
-
+        
+        # Save current scene context information for consumption by the next iterative scene step
+        last_scene_history = history
+        last_scene_history["prompt_id"] = prompt_id
+        
+        files = get_output_filepaths(history)
         if not files:
             raise RuntimeError(f"Scene {scene_idx}: no output files found")
 
@@ -365,20 +399,19 @@ def handler(job):
         chunk_url      = supabase_upload(chunk_path, chunk_filename)
         chunk_urls.append(chunk_url)
         chunk_paths.append(chunk_path)
-        print(f"[handler] Scene {scene_idx} done -> {chunk_url}")
 
     # FFmpeg stitch all chunks into one final video
     if len(chunk_paths) == 1:
         final_local    = chunk_paths[0]
         final_filename = os.path.basename(final_local)
     else:
-        print(f"[handler] Stitching {len(chunk_paths)} chunks with FFmpeg...")
+        print(f"[handler] Stitching {len(chunk_paths)} chunks together...")
         final_filename = f"{job_id}_final.mp4"
         final_local    = os.path.join(output_dir, final_filename)
         ffmpeg_concat(chunk_paths, final_local)
 
     final_url = supabase_upload(final_local, final_filename)
-    print(f"[handler] Final video -> {final_url}")
+    print(f"[handler] Final continuous output video: {final_url}")
 
     return {
         "status":                    "success",
@@ -387,10 +420,7 @@ def handler(job):
         "total_scenes":              num_scenes,
         "total_frames":              total_frames,
         "expected_duration_seconds": round(expected_secs),
-        "expected_duration_minutes": round(expected_secs / 60, 1),
     }
 
 
 runpod.serverless.start({"handler": handler})
-  
-  
