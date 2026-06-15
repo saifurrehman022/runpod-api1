@@ -1,9 +1,12 @@
+
+
 import os
 import time
 import json
 import base64
 import subprocess
 import tempfile
+import copy
 import requests
 import runpod
 
@@ -12,9 +15,6 @@ COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
 COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "1800"))
 
-# =============================================================================
-# SUPABASE CONFIG — set these in RunPod endpoint environment variables
-# =============================================================================
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "https://yaiygjwbtzevjpxncvzu.supabase.co")
 SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhaXlnandidHpldmpweG5jdnp1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTQ2NTA0MiwiZXhwIjoyMDk3MDQxMDQyfQ.ui2Nt6AmAJv8v5XLf2ozumHlBG4BXg7ROIuo80V9UXk")       # paste service_role key in RunPod env vars
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "videos")
@@ -32,10 +32,6 @@ OUTPUT_NODE_TYPES = {
     "SaveAnimatedGIF", "SaveVideo", "VHS_VideoCombine", "PreviewImage",
 }
 
-SCENE_POSITIVE_NODES = ["193:211", "181:152", "203:222"]
-SCENE_NEGATIVE_NODES = ["193:209", "181:206", "203:220"]
-SCENE_SVI_NODES      = ["193:215", "181:160", "203:219"]
-
 MAX_FRAMES_PER_SCENE     = 257
 DEFAULT_FRAMES_PER_SCENE = 81
 DEFAULT_FPS              = 16
@@ -44,34 +40,26 @@ _comfy_ready = False
 
 
 # ===========================================================================
-# SUPABASE STORAGE UPLOAD
+# SUPABASE
 # ===========================================================================
 
 def supabase_upload(local_path: str, remote_filename: str) -> str:
-    """
-    Upload a file to Supabase Storage bucket.
-    Returns the public URL of the uploaded file.
-    """
     if not SUPABASE_KEY:
-        raise RuntimeError("SUPABASE_KEY env var not set. Add it in RunPod endpoint settings.")
-
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_filename}"
-
+        raise RuntimeError("SUPABASE_KEY env var not set.")
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_filename}"
     with open(local_path, "rb") as f:
         resp = requests.post(
-            upload_url,
+            url,
             headers={
                 "Authorization": f"Bearer {SUPABASE_KEY}",
                 "Content-Type": "video/mp4",
-                "x-upsert": "true",   # overwrite if exists
+                "x-upsert": "true",
             },
             data=f,
             timeout=300,
         )
-
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Supabase upload failed {resp.status_code}: {resp.text}")
-
     public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{remote_filename}"
     print(f"[supabase] Uploaded -> {public_url}")
     return public_url
@@ -96,7 +84,7 @@ def wait_for_comfy():
         except Exception as e:
             last_err = e
         time.sleep(1.0)
-    raise RuntimeError(f"ComfyUI not ready after {COMFY_READY_TIMEOUT}s: {last_err}")
+    raise RuntimeError(f"ComfyUI not ready: {last_err}")
 
 
 def comfy_get(path):
@@ -203,9 +191,9 @@ def get_output_filepaths(history):
             for item in node_output.get(key, []):
                 if item.get("type") == "temp":
                     continue
-                fname    = item.get("filename", "")
-                subfolder= item.get("subfolder", "")
-                fpath    = (
+                fname     = item.get("filename", "")
+                subfolder = item.get("subfolder", "")
+                fpath = (
                     os.path.join(output_dir, subfolder, fname)
                     if subfolder else
                     os.path.join(output_dir, fname)
@@ -223,14 +211,19 @@ def workflow_has_output_node(workflow):
 
 
 # ===========================================================================
-# WORKFLOW BUILDING — one scene at a time to avoid OOM
+# WORKFLOW BUILDING
+# Each scene is a FULLY SELF-CONTAINED job — no cross-job node references.
+# Stitching is done by FFmpeg after all scenes complete.
 # ===========================================================================
 
-def build_scene_workflow(base_workflow, scene_idx, positive_text,
-                         negative_text, frames_per_scene, sampling_steps,
-                         uploaded_filename, fps,
-                         prev_sampler_node=None, prev_overlap_node=None):
-    import copy
+def build_single_scene_workflow(base_workflow, positive_text, negative_text,
+                                 frames_per_scene, sampling_steps,
+                                 uploaded_filename, fps, scene_idx):
+    """
+    Build a completely self-contained single-scene workflow.
+    Uses only scene 1 nodes (193:xxx) — no overlap nodes, no cross-scene refs.
+    Output goes directly from VAEDecode → VHS_VideoCombine.
+    """
     wf = copy.deepcopy(base_workflow)
 
     # Patch LoadImage
@@ -245,71 +238,24 @@ def build_scene_workflow(base_workflow, scene_idx, positive_text,
             if isinstance(node, dict) and node.get("class_type") == "BasicScheduler":
                 node["inputs"]["steps"] = int(sampling_steps)
 
-    if scene_idx == 1:
-        wf["193:211"]["inputs"]["text"] = positive_text
-        wf["193:209"]["inputs"]["text"] = negative_text
-        wf["193:215"]["inputs"]["length"] = frames_per_scene
-        wf["204"]["inputs"]["images"] = ["193:217", 0]
-        wf["204"]["inputs"]["frame_rate"] = fps
-        to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
-        for k in to_remove:
-            del wf[k]
-        return wf, "193:216", None
+    # Patch scene 1 prompts and frames
+    wf["193:211"]["inputs"]["text"] = positive_text
+    wf["193:209"]["inputs"]["text"] = negative_text
+    wf["193:215"]["inputs"]["length"] = frames_per_scene
+    # Use unique seed per scene
+    wf["189"]["inputs"]["noise_seed"] = 43 + scene_idx
 
-    elif scene_idx == 2:
-        wf["193:211"]["inputs"]["text"] = positive_text
-        wf["193:209"]["inputs"]["text"] = negative_text
-        wf["193:215"]["inputs"]["length"] = frames_per_scene
-        wf["181:152"]["inputs"]["text"] = positive_text
-        wf["181:206"]["inputs"]["text"] = negative_text
-        wf["181:160"]["inputs"]["length"] = frames_per_scene
-        wf["204"]["inputs"]["images"] = ["181:168", 0]
-        wf["204"]["inputs"]["frame_rate"] = fps
-        to_remove = [k for k in wf if k.startswith("203:")]
-        for k in to_remove:
-            del wf[k]
-        return wf, "181:208", "181:168"
+    # Wire VHS directly to scene 1 VAEDecode output (no overlap node needed)
+    wf["204"]["inputs"]["images"] = ["193:217", 0]
+    wf["204"]["inputs"]["frame_rate"] = fps
+    wf["204"]["inputs"]["filename_prefix"] = f"scene_{scene_idx:02d}"
 
-    elif scene_idx == 3:
-        wf["193:211"]["inputs"]["text"] = positive_text
-        wf["193:209"]["inputs"]["text"] = negative_text
-        wf["193:215"]["inputs"]["length"] = frames_per_scene
-        wf["181:152"]["inputs"]["text"] = positive_text
-        wf["181:206"]["inputs"]["text"] = negative_text
-        wf["181:160"]["inputs"]["length"] = frames_per_scene
-        wf["203:222"]["inputs"]["text"] = positive_text
-        wf["203:220"]["inputs"]["text"] = negative_text
-        wf["203:219"]["inputs"]["length"] = frames_per_scene
-        wf["204"]["inputs"]["images"] = ["203:227", 0]
-        wf["204"]["inputs"]["frame_rate"] = fps
-        return wf, "203:226", "203:227"
+    # Remove all scene 2 and scene 3 nodes — not needed
+    to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
+    for k in to_remove:
+        del wf[k]
 
-    else:
-        # Dynamic extra scene
-        p       = f"EXT{scene_idx}"
-        pos_id  = f"{p}:pos";  neg_id  = f"{p}:neg"
-        svi_id  = f"{p}:svi";  n_id    = f"{p}:n"
-        dn_id   = f"{p}:dn";   cfgh_id = f"{p}:cfgh"
-        cfgl_id = f"{p}:cfgl"; s1_id   = f"{p}:s1"
-        s2_id   = f"{p}:s2";   dec_id  = f"{p}:dec"
-        ovlp_id = f"{p}:ovlp"
-
-        wf[pos_id]  = {"inputs": {"text": positive_text, "clip": ["84", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": f"Pos {scene_idx}"}}
-        wf[neg_id]  = {"inputs": {"text": negative_text, "clip": ["84", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": f"Neg {scene_idx}"}}
-        wf[n_id]    = {"inputs": {"noise_seed": 43 + scene_idx}, "class_type": "RandomNoise", "_meta": {"title": "RandomNoise"}}
-        wf[dn_id]   = {"inputs": {}, "class_type": "DisableNoise", "_meta": {"title": "DisableNoise"}}
-        wf[svi_id]  = {"inputs": {"length": frames_per_scene, "motion_latent_count": 1, "positive": [pos_id, 0], "negative": [neg_id, 0], "anchor_samples": ["135", 0], "prev_samples": [prev_sampler_node, 0]}, "class_type": "WanImageToVideoSVIPro", "_meta": {"title": "WanImageToVideoSVIPro"}}
-        wf[cfgh_id] = {"inputs": {"cfg": 1, "start_percent": 0, "end_percent": 1, "model": ["141", 0], "positive": [svi_id, 0], "negative": [svi_id, 1]}, "class_type": "ScheduledCFGGuidance", "_meta": {"title": "CFG HIGH"}}
-        wf[cfgl_id] = {"inputs": {"cfg": 1, "start_percent": 0, "end_percent": 1, "model": ["142", 0], "positive": [svi_id, 0], "negative": [svi_id, 1]}, "class_type": "ScheduledCFGGuidance", "_meta": {"title": "CFG LOW"}}
-        wf[s1_id]   = {"inputs": {"noise": [n_id, 0], "guider": [cfgh_id, 0], "sampler": ["127", 0], "sigmas": ["128", 0], "latent_image": [svi_id, 2]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "Sampler1"}}
-        wf[s2_id]   = {"inputs": {"noise": [dn_id, 0], "guider": [cfgl_id, 0], "sampler": ["127", 0], "sigmas": ["128", 1], "latent_image": [s1_id, 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "Sampler2"}}
-        wf[dec_id]  = {"inputs": {"samples": [s2_id, 0], "vae": ["90", 0]}, "class_type": "VAEDecode", "_meta": {"title": "VAE Decode"}}
-        wf[ovlp_id] = {"inputs": {"overlap": 5, "overlap_side": "source", "overlap_mode": "linear_blend", "source_images": [prev_overlap_node, 0], "new_images": [dec_id, 0]}, "class_type": "ImageBatchExtendWithOverlap", "_meta": {"title": "Overlap"}}
-
-        wf["204"]["inputs"]["images"]     = [ovlp_id, 0]
-        wf["204"]["inputs"]["frame_rate"] = fps
-
-        return wf, s2_id, ovlp_id
+    return wf
 
 
 # ===========================================================================
@@ -317,14 +263,17 @@ def build_scene_workflow(base_workflow, scene_idx, positive_text,
 # ===========================================================================
 
 def ffmpeg_concat(video_paths: list, output_path: str):
+    """Concatenate video files using FFmpeg — no re-encoding, just stream copy."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         for vp in video_paths:
-            f.write(f"file '{vp}'\n")
+            f.write(f"file '{os.path.abspath(vp)}'\n")
         list_file = f.name
+
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
            "-i", list_file, "-c", "copy", output_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     os.unlink(list_file)
+
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg stitch failed: {result.stderr}")
     return output_path
@@ -374,35 +323,30 @@ def handler(job):
     fps              = int(payload.get("fps", DEFAULT_FPS))
     num_scenes       = max(1, int(payload.get("num_scenes", 3)))
 
-    job_id       = job.get("id", f"job_{int(time.time())}")
-    output_dir   = find_output_dir()
-    chunk_urls   = []
-    chunk_paths  = []
+    job_id      = job.get("id", f"job_{int(time.time())}")
+    output_dir  = find_output_dir()
+    chunk_urls  = []
+    chunk_paths = []
 
     total_frames  = frames_per_scene * num_scenes
     expected_secs = total_frames / fps
     print(f"[handler] {num_scenes} scenes x {frames_per_scene} frames @ {fps}fps "
           f"= {total_frames} frames = {expected_secs:.0f}s ({expected_secs/60:.1f} min)")
 
-    prev_sampler = None
-    prev_overlap = None
-
-    # Run each scene separately — free VRAM between scenes
+    # Run each scene as a fully independent self-contained ComfyUI job
     for scene_idx in range(1, num_scenes + 1):
         pos_text = prompts[min(scene_idx - 1, len(prompts) - 1)]
         print(f"[handler] Scene {scene_idx}/{num_scenes}: {pos_text[:60]}")
 
-        wf, prev_sampler, prev_overlap = build_scene_workflow(
+        wf = build_single_scene_workflow(
             base_workflow,
-            scene_idx=scene_idx,
             positive_text=pos_text,
             negative_text=negative_text,
             frames_per_scene=frames_per_scene,
             sampling_steps=sampling_steps,
             uploaded_filename=uploaded_filename,
             fps=fps,
-            prev_sampler_node=prev_sampler,
-            prev_overlap_node=prev_overlap,
+            scene_idx=scene_idx,
         )
 
         result    = submit_prompt(wf, f"runpod_s{scene_idx}")
@@ -423,12 +367,12 @@ def handler(job):
         chunk_paths.append(chunk_path)
         print(f"[handler] Scene {scene_idx} done -> {chunk_url}")
 
-    # Stitch all chunks into final video
+    # FFmpeg stitch all chunks into one final video
     if len(chunk_paths) == 1:
         final_local    = chunk_paths[0]
         final_filename = os.path.basename(final_local)
     else:
-        print(f"[handler] Stitching {len(chunk_paths)} chunks...")
+        print(f"[handler] Stitching {len(chunk_paths)} chunks with FFmpeg...")
         final_filename = f"{job_id}_final.mp4"
         final_local    = os.path.join(output_dir, final_filename)
         ffmpeg_concat(chunk_paths, final_local)
@@ -448,3 +392,5 @@ def handler(job):
 
 
 runpod.serverless.start({"handler": handler})
+  
+  
