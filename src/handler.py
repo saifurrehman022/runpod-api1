@@ -1,473 +1,470 @@
+
 import os
 import time
 import json
 import base64
-import subprocess
-import tempfile
+import copy
 import requests
 import runpod
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
-COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "1800"))
-
-HF_TOKEN  = os.environ.get("HF_TOKEN", "")
-HF_BUCKET = os.environ.get("HF_BUCKET", "KKKONNK/used123")
+COMFY_READY_TIMEOUT = int(os.environ.get("COMFY_READY_TIMEOUT", "7200000"))  # 2hr for long jobs
+COMFY_READY_POLL = 1.0
 
 DEFAULT_WORKFLOW_PATH = "/workflow.json"
 
 COMFY_OUTPUT_DIRS = [
-    "/comfyui/output",
-    "/comfyui/ComfyUI/output",
-    "/root/comfyui/output",
+    "/comfyui/output",
+    "/comfyui/ComfyUI/output",
+    "/root/comfyui/output",
 ]
 
 OUTPUT_NODE_TYPES = {
-    "SaveImage", "SaveAnimatedWEBP", "SaveAnimatedPNG",
-    "SaveAnimatedGIF", "SaveVideo", "VHS_VideoCombine", "PreviewImage",
+    "SaveImage", "SaveAnimatedWEBP", "SaveAnimatedPNG",
+    "SaveAnimatedGIF", "SaveVideo", "VHS_VideoCombine", "PreviewImage",
 }
 
+# Base scene node IDs (3 scenes in the baked workflow)
 SCENE_POSITIVE_NODES = ["193:211", "181:152", "203:222"]
 SCENE_NEGATIVE_NODES = ["193:209", "181:206", "203:220"]
-SCENE_SVI_NODES      = ["193:215", "181:160", "203:219"]
 
-MAX_FRAMES_PER_SCENE  = 257
+# WanImageToVideoSVIPro node IDs per scene
+SCENE_SVI_NODES = ["193:215", "181:160", "203:219"]
+
+# Max safe frames per scene chunk on A100 80GB
+MAX_FRAMES_PER_SCENE = 257
 DEFAULT_FRAMES_PER_SCENE = 81
 DEFAULT_FPS = 16
 
 _comfy_ready = False
 
 
-# ===========================================================================
-# HF BUCKET UPLOAD
-# ===========================================================================
-
-def hf_upload_file(local_path: str, remote_filename: str) -> str:
-    """
-    Upload a file to HF bucket using the HTTP API.
-    Returns the public URL of the uploaded file.
-    """
-    url = f"https://huggingface.co/api/buckets/{HF_BUCKET}/upload/{remote_filename}"
-    with open(local_path, "rb") as f:
-        resp = requests.put(
-            url,
-            headers={"Authorization": f"Bearer {HF_TOKEN}"},
-            data=f,
-            timeout=300,
-        )
-    resp.raise_for_status()
-    public_url = f"https://huggingface.co/api/buckets/{HF_BUCKET}/{remote_filename}"
-    print(f"[hf_upload] Uploaded {remote_filename} -> {public_url}")
-    return public_url
-
-
-# ===========================================================================
-# COMFY HELPERS
-# ===========================================================================
-
 def wait_for_comfy():
-    global _comfy_ready
-    if _comfy_ready:
-        return
-    start = time.time()
-    last_err = None
-    while time.time() - start < COMFY_READY_TIMEOUT:
-        try:
-            r = requests.get(f"{COMFY_BASE}/system_stats", timeout=3)
-            if r.status_code == 200:
-                _comfy_ready = True
-                return
-        except Exception as e:
-            last_err = e
-        time.sleep(1.0)
-    raise RuntimeError(f"ComfyUI not ready after {COMFY_READY_TIMEOUT}s: {last_err}")
+    global _comfy_ready
+    if _comfy_ready:
+        return
+    start = time.time()
+    last_err = None
+    while time.time() - start < COMFY_READY_TIMEOUT:
+        try:
+            r = requests.get(f"{COMFY_BASE}/system_stats", timeout=3)
+            if r.status_code == 200:
+                _comfy_ready = True
+                return
+        except Exception as e:
+            last_err = e
+        time.sleep(COMFY_READY_POLL)
+    raise RuntimeError(f"ComfyUI did not become ready in {COMFY_READY_TIMEOUT}s: {last_err}")
 
 
 def comfy_get(path):
-    r = requests.get(f"{COMFY_BASE}{path}", timeout=30)
-    r.raise_for_status()
-    return r.json()
+    r = requests.get(f"{COMFY_BASE}{path}", timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 
 def load_default_workflow():
-    with open(DEFAULT_WORKFLOW_PATH) as f:
-        return json.load(f)
+    with open(DEFAULT_WORKFLOW_PATH) as f:
+        return json.load(f)
 
 
-def find_output_dir():
-    for d in COMFY_OUTPUT_DIRS:
-        if os.path.isdir(d):
-            return d
-    return COMFY_OUTPUT_DIRS[0]
+def build_extra_scene(workflow, scene_idx, prev_sampler_node_id,
+                      prev_decode_node_id, prev_overlap_node_id,
+                      frames_per_scene, positive_text, negative_text,
+                      noise_seed=43):
+    """
+    Dynamically add an extra SVI extension scene to the workflow.
+    Clones the pattern from scene 2 (181:xxx nodes) with new IDs.
+    Returns new node IDs: (sampler2_id, decode_id, overlap_id)
+    """
+    prefix = f"EXT{scene_idx}"
+
+    pos_id   = f"{prefix}:pos"
+    neg_id   = f"{prefix}:neg"
+    svi_id   = f"{prefix}:svi"
+    noise_id = f"{prefix}:noise"
+    dnoise_id= f"{prefix}:dnoise"
+    cfg_h_id = f"{prefix}:cfgh"
+    cfg_l_id = f"{prefix}:cfgl"
+    samp1_id = f"{prefix}:samp1"
+    samp2_id = f"{prefix}:samp2"
+    dec_id   = f"{prefix}:dec"
+    ovlp_id  = f"{prefix}:ovlp"
+
+    workflow[pos_id] = {
+        "inputs": {"text": positive_text, "clip": ["84", 0]},
+        "class_type": "CLIPTextEncode",
+        "_meta": {"title": f"Positive Prompt Scene {scene_idx}"}
+    }
+    workflow[neg_id] = {
+        "inputs": {"text": negative_text, "clip": ["84", 0]},
+        "class_type": "CLIPTextEncode",
+        "_meta": {"title": f"Negative Prompt Scene {scene_idx}"}
+    }
+    workflow[noise_id] = {
+        "inputs": {"noise_seed": noise_seed + scene_idx},
+        "class_type": "RandomNoise",
+        "_meta": {"title": "RandomNoise"}
+    }
+    workflow[dnoise_id] = {
+        "inputs": {},
+        "class_type": "DisableNoise",
+        "_meta": {"title": "DisableNoise"}
+    }
+    workflow[svi_id] = {
+        "inputs": {
+            "length": frames_per_scene,
+            "motion_latent_count": 1,
+            "positive": [pos_id, 0],
+            "negative": [neg_id, 0],
+            "anchor_samples": ["135", 0],
+            "prev_samples": [prev_sampler_node_id, 0]
+        },
+        "class_type": "WanImageToVideoSVIPro",
+        "_meta": {"title": "WanImageToVideoSVIPro"}
+    }
+    workflow[cfg_h_id] = {
+        "inputs": {"cfg": 1, "start_percent": 0, "end_percent": 1,
+                   "model": ["141", 0], "positive": [svi_id, 0], "negative": [svi_id, 1]},
+        "class_type": "ScheduledCFGGuidance",
+        "_meta": {"title": "ScheduledCFGGuidance HIGH"}
+    }
+    workflow[cfg_l_id] = {
+        "inputs": {"cfg": 1, "start_percent": 0, "end_percent": 1,
+                   "model": ["142", 0], "positive": [svi_id, 0], "negative": [svi_id, 1]},
+        "class_type": "ScheduledCFGGuidance",
+        "_meta": {"title": "ScheduledCFGGuidance LOW"}
+    }
+    workflow[samp1_id] = {
+        "inputs": {"noise": [noise_id, 0], "guider": [cfg_h_id, 0],
+                   "sampler": ["127", 0], "sigmas": ["128", 0],
+                   "latent_image": [svi_id, 2]},
+        "class_type": "SamplerCustomAdvanced",
+        "_meta": {"title": "SamplerCustomAdvanced 1"}
+    }
+    workflow[samp2_id] = {
+        "inputs": {"noise": [dnoise_id, 0], "guider": [cfg_l_id, 0],
+                   "sampler": ["127", 0], "sigmas": ["128", 1],
+                   "latent_image": [samp1_id, 0]},
+        "class_type": "SamplerCustomAdvanced",
+        "_meta": {"title": "SamplerCustomAdvanced 2"}
+    }
+    workflow[dec_id] = {
+        "inputs": {"samples": [samp2_id, 0], "vae": ["90", 0]},
+        "class_type": "VAEDecode",
+        "_meta": {"title": "VAE Decode"}
+    }
+    workflow[ovlp_id] = {
+        "inputs": {
+            "overlap": 5,
+            "overlap_side": "source",
+            "overlap_mode": "linear_blend",
+            "source_images": [prev_overlap_node_id, 0],
+            "new_images": [dec_id, 0]
+        },
+        "class_type": "ImageBatchExtendWithOverlap",
+        "_meta": {"title": "ImageBatchExtendWithOverlap"}
+    }
+
+    return samp2_id, dec_id, ovlp_id
 
 
-def fetch_image_from_url(url: str, filename: str = "input_image.png") -> str:
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    image_bytes = resp.content
-    ct = resp.headers.get("Content-Type", "")
-    if "jpeg" in ct or "jpg" in ct:
-        filename = filename.replace(".png", ".jpg")
-    elif "webp" in ct:
-        filename = filename.replace(".png", ".webp")
-    upload_resp = requests.post(
-        f"{COMFY_BASE}/upload/image",
-        files={"image": (filename, image_bytes, ct or "image/png")},
-        data={"overwrite": "true"},
-        timeout=60,
-    )
-    upload_resp.raise_for_status()
-    return upload_resp.json().get("name", filename)
+def patch_workflow_inputs(workflow, uploaded_filename=None, prompts=None,
+                          negative_prompt=None, sampling_steps=None,
+                          frames_per_scene=None, fps=None, num_scenes=None):
+    """
+    Patch all inputs. Dynamically extends scenes beyond 3 if num_scenes > 3.
 
+    frames_per_scene: frames per SVI chunk (max 257 on A100 80GB)
+    num_scenes: total scenes 3-12 (3 are baked, extras added dynamically)
+    fps: output video frame rate
+    """
+    fps = fps or DEFAULT_FPS
+    frames_per_scene = min(int(frames_per_scene or DEFAULT_FRAMES_PER_SCENE), MAX_FRAMES_PER_SCENE)
+    num_scenes = max(3, int(num_scenes or 3))
 
-def upload_images_to_comfy(images):
-    uploaded = []
-    for img in images:
-        name = img["name"]
-        b64 = img["image"]
-        if "," in b64:
-            b64 = b64.split(",", 1)[1]
-        image_bytes = base64.b64decode(b64)
-        resp = requests.post(
-            f"{COMFY_BASE}/upload/image",
-            files={"image": (name, image_bytes, "image/png")},
-            data={"overwrite": "true"},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        uploaded.append(resp.json().get("name", name))
-    return uploaded
+    default_neg = workflow.get("193:209", {}).get("inputs", {}).get("text", "")
 
+    # 1. Patch LoadImage
+    if uploaded_filename:
+        for node_id, node in workflow.items():
+            if isinstance(node, dict) and node.get("class_type") == "LoadImage":
+                node["inputs"]["image"] = uploaded_filename
 
-def resolve_input_image(payload: dict):
-    for key in ("image_url", "source_url", "target_url"):
-        url = payload.get(key)
-        if url:
-            return fetch_image_from_url(url, f"{key.replace('_url','')}_image.png")
-    images = payload.get("images", [])
-    if images:
-        uploaded = upload_images_to_comfy(images)
-        if uploaded:
-            return uploaded[0]
-    return None
+    # 2. Patch positive prompts for base 3 scenes
+    if prompts:
+        for idx, node_id in enumerate(SCENE_POSITIVE_NODES):
+            if node_id in workflow:
+                scene_prompt = prompts[min(idx, len(prompts) - 1)]
+                workflow[node_id]["inputs"]["text"] = scene_prompt
 
+    # 3. Patch negative prompt
+    if negative_prompt:
+        for node_id in SCENE_NEGATIVE_NODES:
+            if node_id in workflow:
+                workflow[node_id]["inputs"]["text"] = negative_prompt
 
-def submit_prompt(prompt, client_id="runpod"):
-    r = requests.post(
-        f"{COMFY_BASE}/prompt",
-        json={"prompt": prompt, "client_id": client_id},
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json()
+    # 4. Patch frames_per_scene on all WanImageToVideoSVIPro nodes
+    for node_id in SCENE_SVI_NODES:
+        if node_id in workflow:
+            workflow[node_id]["inputs"]["length"] = frames_per_scene
 
+    # 5. Patch sampling steps
+    if sampling_steps is not None:
+        for node_id, node in workflow.items():
+            if isinstance(node, dict) and node.get("class_type") == "BasicScheduler":
+                node["inputs"]["steps"] = int(sampling_steps)
 
-def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400):
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            if prompt_id in data:
-                return data[prompt_id]
-        except requests.exceptions.ConnectionError:
-            # ComfyUI may briefly drop connection under load — retry
-            print("[wait_for_history] Connection error, retrying...")
-            time.sleep(5)
-            continue
-        time.sleep(poll_interval)
-    raise RuntimeError(f"Prompt {prompt_id} did not finish within {timeout}s")
+    # 6. Dynamically add extra scenes beyond the base 3
+    if num_scenes > 3:
+        # Last sampler output from scene 3
+        prev_sampler = "203:226"
+        prev_decode  = "203:218"
+        prev_overlap = "203:227"
 
+        for extra_idx in range(4, num_scenes + 1):
+            # Determine prompt for this extra scene
+            if prompts:
+                extra_prompt = prompts[min(extra_idx - 1, len(prompts) - 1)]
+            else:
+                extra_prompt = workflow.get("203:222", {}).get("inputs", {}).get("text", "")
 
-def get_output_filepaths(history):
-    output_dir = find_output_dir()
-    files = []
-    for _, node_output in history.get("outputs", {}).items():
-        for key in ("images", "videos", "gifs", "files"):
-            for item in node_output.get(key, []):
-                if item.get("type") == "temp":
-                    continue
-                fname = item.get("filename", "")
-                subfolder = item.get("subfolder", "")
-                fpath = (
-                    os.path.join(output_dir, subfolder, fname)
-                    if subfolder else
-                    os.path.join(output_dir, fname)
-                )
-                if os.path.isfile(fpath):
-                    files.append({"filename": fname, "filepath": fpath})
-    return files
+            neg = negative_prompt or default_neg
 
+            prev_sampler, prev_decode, prev_overlap = build_extra_scene(
+                workflow,
+                scene_idx=extra_idx,
+                prev_sampler_node_id=prev_sampler,
+                prev_decode_node_id=prev_decode,
+                prev_overlap_node_id=prev_overlap,
+                frames_per_scene=frames_per_scene,
+                positive_text=extra_prompt,
+                negative_text=neg,
+            )
 
-# ===========================================================================
-# WORKFLOW BUILDING
-# ===========================================================================
+        # Rewire VHS_VideoCombine to new final overlap node
+        for node_id, node in workflow.items():
+            if isinstance(node, dict) and node.get("class_type") == "VHS_VideoCombine":
+                node["inputs"]["images"] = [prev_overlap, 0]
 
-def build_scene_workflow(base_workflow, scene_idx, positive_text,
-                          negative_text, frames_per_scene, sampling_steps,
-                          uploaded_filename, fps, prev_sampler_node=None,
-                          prev_decode_node=None, prev_overlap_node=None):
-    """
-    Build a single-scene workflow for scene_idx (1-based).
-    Scenes 1-3 use the baked node IDs.
-    Scenes 4+ clone the extension pattern.
-    Returns (workflow_dict, vhs_node_id, final_sampler_node, final_decode_node, final_overlap_node)
-    """
-    import copy
-    wf = copy.deepcopy(base_workflow)
+    # 7. Patch FPS in VHS_VideoCombine
+    for node_id, node in workflow.items():
+        if isinstance(node, dict) and node.get("class_type") == "VHS_VideoCombine":
+            node["inputs"]["frame_rate"] = fps
 
-    # Patch LoadImage
-    if uploaded_filename:
-        for nid, node in wf.items():
-            if isinstance(node, dict) and node.get("class_type") == "LoadImage":
-                node["inputs"]["image"] = uploaded_filename
-
-    # Patch steps
-    if sampling_steps:
-        for nid, node in wf.items():
-            if isinstance(node, dict) and node.get("class_type") == "BasicScheduler":
-                node["inputs"]["steps"] = int(sampling_steps)
-
-    if scene_idx == 1:
-        # Use only scene 1 nodes, remove scenes 2 and 3
-        # Patch scene 1 prompt
-        wf["193:211"]["inputs"]["text"] = positive_text
-        wf["193:209"]["inputs"]["text"] = negative_text
-        wf["193:215"]["inputs"]["length"] = frames_per_scene
-
-        # Wire VHS directly to scene 1 decode output
-        wf["204"]["inputs"]["images"] = ["193:217", 0]
-        wf["204"]["inputs"]["frame_rate"] = fps
-
-        # Remove scene 2 and 3 nodes
-        to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
-        for k in to_remove:
-            del wf[k]
-
-        return wf, "204", "193:216", "193:217", None
-
-    elif scene_idx == 2:
-        # Scenes 1+2, remove scene 3
-        wf["193:211"]["inputs"]["text"] = positive_text  # reuse scene1 prompt
-        wf["193:209"]["inputs"]["text"] = negative_text
-        wf["193:215"]["inputs"]["length"] = frames_per_scene
-        wf["181:152"]["inputs"]["text"] = positive_text
-        wf["181:206"]["inputs"]["text"] = negative_text
-        wf["181:160"]["inputs"]["length"] = frames_per_scene
-
-        wf["204"]["inputs"]["images"] = ["181:168", 0]
-        wf["204"]["inputs"]["frame_rate"] = fps
-
-        to_remove = [k for k in wf if k.startswith("203:")]
-        for k in to_remove:
-            del wf[k]
-
-        return wf, "204", "181:208", "181:162", "181:168"
-
-    elif scene_idx == 3:
-        # All 3 base scenes
-        wf["193:211"]["inputs"]["text"] = positive_text
-        wf["193:209"]["inputs"]["text"] = negative_text
-        wf["193:215"]["inputs"]["length"] = frames_per_scene
-        wf["181:152"]["inputs"]["text"] = positive_text
-        wf["181:206"]["inputs"]["text"] = negative_text
-        wf["181:160"]["inputs"]["length"] = frames_per_scene
-        wf["203:222"]["inputs"]["text"] = positive_text
-        wf["203:220"]["inputs"]["text"] = negative_text
-        wf["203:219"]["inputs"]["length"] = frames_per_scene
-
-        wf["204"]["inputs"]["images"] = ["203:227", 0]
-        wf["204"]["inputs"]["frame_rate"] = fps
-
-        return wf, "204", "203:226", "203:218", "203:227"
-
-    else:
-        # Extra scene — build on top of 3-scene base, add one extension
-        p = f"EXT{scene_idx}"
-        pos_id   = f"{p}:pos"
-        neg_id   = f"{p}:neg"
-        svi_id   = f"{p}:svi"
-        noise_id = f"{p}:noise"
-        dn_id    = f"{p}:dn"
-        cfgh_id  = f"{p}:cfgh"
-        cfgl_id  = f"{p}:cfgl"
-        s1_id    = f"{p}:s1"
-        s2_id    = f"{p}:s2"
-        dec_id   = f"{p}:dec"
-        ovlp_id  = f"{p}:ovlp"
-
-        wf[pos_id]  = {"inputs": {"text": positive_text, "clip": ["84", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": f"Pos {scene_idx}"}}
-        wf[neg_id]  = {"inputs": {"text": negative_text, "clip": ["84", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": f"Neg {scene_idx}"}}
-        wf[noise_id]= {"inputs": {"noise_seed": 43 + scene_idx}, "class_type": "RandomNoise", "_meta": {"title": "RandomNoise"}}
-        wf[dn_id]   = {"inputs": {}, "class_type": "DisableNoise", "_meta": {"title": "DisableNoise"}}
-        wf[svi_id]  = {"inputs": {"length": frames_per_scene, "motion_latent_count": 1, "positive": [pos_id, 0], "negative": [neg_id, 0], "anchor_samples": ["135", 0], "prev_samples": [prev_sampler_node, 0]}, "class_type": "WanImageToVideoSVIPro", "_meta": {"title": "WanImageToVideoSVIPro"}}
-        wf[cfgh_id] = {"inputs": {"cfg": 1, "start_percent": 0, "end_percent": 1, "model": ["141", 0], "positive": [svi_id, 0], "negative": [svi_id, 1]}, "class_type": "ScheduledCFGGuidance", "_meta": {"title": "CFG HIGH"}}
-        wf[cfgl_id] = {"inputs": {"cfg": 1, "start_percent": 0, "end_percent": 1, "model": ["142", 0], "positive": [svi_id, 0], "negative": [svi_id, 1]}, "class_type": "ScheduledCFGGuidance", "_meta": {"title": "CFG LOW"}}
-        wf[s1_id]   = {"inputs": {"noise": [noise_id, 0], "guider": [cfgh_id, 0], "sampler": ["127", 0], "sigmas": ["128", 0], "latent_image": [svi_id, 2]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "Sampler1"}}
-        wf[s2_id]   = {"inputs": {"noise": [dn_id, 0], "guider": [cfgl_id, 0], "sampler": ["127", 0], "sigmas": ["128", 1], "latent_image": [s1_id, 0]}, "class_type": "SamplerCustomAdvanced", "_meta": {"title": "Sampler2"}}
-        wf[dec_id]  = {"inputs": {"samples": [s2_id, 0], "vae": ["90", 0]}, "class_type": "VAEDecode", "_meta": {"title": "VAE Decode"}}
-        wf[ovlp_id] = {"inputs": {"overlap": 5, "overlap_side": "source", "overlap_mode": "linear_blend", "source_images": [prev_overlap_node, 0], "new_images": [dec_id, 0]}, "class_type": "ImageBatchExtendWithOverlap", "_meta": {"title": "Overlap"}}
-
-        wf["204"]["inputs"]["images"] = [ovlp_id, 0]
-        wf["204"]["inputs"]["frame_rate"] = fps
-
-        return wf, "204", s2_id, dec_id, ovlp_id
+    return workflow
 
 
 def workflow_has_output_node(workflow):
-    return any(
-        isinstance(node, dict) and node.get("class_type") in OUTPUT_NODE_TYPES
-        for node in workflow.values()
-    )
+    return any(
+        isinstance(node, dict) and node.get("class_type") in OUTPUT_NODE_TYPES
+        for node in workflow.values()
+    )
 
 
-# ===========================================================================
-# FFMPEG STITCH
-# ===========================================================================
-
-def ffmpeg_concat(video_paths: list, output_path: str, fps: int):
-    """Concatenate video files using FFmpeg concat demuxer."""
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-        for vp in video_paths:
-            f.write(f"file '{vp}'\n")
-        list_file = f.name
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
-        "-c", "copy",
-        output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    os.unlink(list_file)
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed: {result.stderr}")
-    return output_path
+def validate_workflow(workflow):
+    if not isinstance(workflow, dict):
+        raise ValueError("Workflow must be a dict of ComfyUI nodes.")
+    if not workflow_has_output_node(workflow):
+        present = sorted({
+            node["class_type"]
+            for node in workflow.values()
+            if isinstance(node, dict) and "class_type" in node
+        })
+        raise RuntimeError(
+            "Workflow has no output node. Need one of: "
+            + ", ".join(sorted(OUTPUT_NODE_TYPES))
+            + ". Present: " + ", ".join(present)
+        )
 
 
-# ===========================================================================
-# MAIN HANDLER
-# ===========================================================================
+def fetch_image_from_url(url: str, filename: str = "input_image.png") -> str:
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    image_bytes = resp.content
+    ct = resp.headers.get("Content-Type", "")
+    if "jpeg" in ct or "jpg" in ct:
+        filename = filename.replace(".png", ".jpg")
+    elif "webp" in ct:
+        filename = filename.replace(".png", ".webp")
+    upload_resp = requests.post(
+        f"{COMFY_BASE}/upload/image",
+        files={"image": (filename, image_bytes, ct or "image/png")},
+        data={"overwrite": "true"},
+        timeout=60,
+    )
+    upload_resp.raise_for_status()
+    return upload_resp.json().get("name", filename)
+
+
+def upload_images_to_comfy(images):
+    uploaded = []
+    for img in images:
+        name = img["name"]
+        b64 = img["image"]
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        image_bytes = base64.b64decode(b64)
+        resp = requests.post(
+            f"{COMFY_BASE}/upload/image",
+            files={"image": (name, image_bytes, "image/png")},
+            data={"overwrite": "true"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        uploaded.append(resp.json().get("name", name))
+    return uploaded
+
+
+def resolve_input_image(payload: dict):
+    for key in ("image_url", "source_url", "target_url"):
+        url = payload.get(key)
+        if url:
+            filename = f"{key.replace('_url', '')}_image.png"
+            return fetch_image_from_url(url, filename)
+    images = payload.get("images", [])
+    if images:
+        uploaded = upload_images_to_comfy(images)
+        if uploaded:
+            return uploaded[0]
+    return None
+
+
+def submit_prompt(prompt, client_id="runpod"):
+    r = requests.post(
+        f"{COMFY_BASE}/prompt",
+        json={"prompt": prompt, "client_id": client_id},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def wait_for_history(prompt_id, poll_interval=2.0, timeout=1455555400):  # 4hr timeout
+    start = time.time()
+    while time.time() - start < timeout:
+        r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=37770)
+        r.raise_for_status()
+        data = r.json()
+        if prompt_id in data:
+            return data[prompt_id]
+        time.sleep(poll_interval)
+    raise RuntimeError(f"Prompt {prompt_id} did not finish within {timeout}s")
+
+
+def find_output_dir():
+    for d in COMFY_OUTPUT_DIRS:
+        if os.path.isdir(d):
+            return d
+    return COMFY_OUTPUT_DIRS[0]
+
+
+def get_output_filepaths(history):
+    output_dir = find_output_dir()
+    files = []
+    for _, node_output in history.get("outputs", {}).items():
+        for key in ("images", "videos", "gifs", "files"):
+            for item in node_output.get(key, []):
+                if item.get("type") == "temp":
+                    continue
+                fname = item.get("filename", "")
+                subfolder = item.get("subfolder", "")
+                fpath = (
+                    os.path.join(output_dir, subfolder, fname)
+                    if subfolder
+                    else os.path.join(output_dir, fname)
+                )
+                if os.path.isfile(fpath):
+                    files.append({"filename": fname, "filepath": fpath})
+    return files
+
+
+def file_to_base64(filepath):
+    with open(filepath, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def extract_outputs_base64(history):
+    return [
+        {"filename": item["filename"], "base64": file_to_base64(item["filepath"])}
+        for item in get_output_filepaths(history)
+    ]
+
 
 def handler(job):
-    payload = job.get("input") or {}
-    action  = payload.get("action")
+    payload = job.get("input") or {}
+    action = payload.get("action")
 
-    if action == "ping":
-        return {"status": "ok"}
-    if action == "comfy_system_stats":
-        wait_for_comfy()
-        return comfy_get("/system_stats")
+    if action == "ping":
+        return {"status": "ok"}
+    if action == "comfy_system_stats":
+        wait_for_comfy()
+        return comfy_get("/system_stats")
 
-    wait_for_comfy()
+    wait_for_comfy()
 
-    base_workflow = payload.get("workflow") or payload.get("prompt")
-    if base_workflow:
-        if isinstance(base_workflow, str):
-            base_workflow = json.loads(base_workflow)
-    else:
-        base_workflow = load_default_workflow()
+    workflow = payload.get("workflow") or payload.get("prompt")
+    if workflow:
+        if isinstance(workflow, str):
+            workflow = json.loads(workflow)
+    else:
+        workflow = load_default_workflow()
 
-    if not workflow_has_output_node(base_workflow):
-        raise RuntimeError("Workflow has no output node.")
+    validate_workflow(workflow)
 
-    uploaded_filename = resolve_input_image(payload)
+    uploaded_filename = resolve_input_image(payload)
 
-    # Prompts
-    raw_prompts  = payload.get("prompts")
-    prompt_text  = payload.get("prompt_text") or payload.get("prompt")
-    if raw_prompts and isinstance(raw_prompts, list):
-        prompts = raw_prompts
-    elif prompt_text:
-        prompts = [prompt_text]
-    else:
-        prompts = ["cinematic video, smooth motion, highly detailed"]
+    raw_prompts = payload.get("prompts")
+    prompt_text = payload.get("prompt_text") or payload.get("prompt")
+    if raw_prompts and isinstance(raw_prompts, list):
+        prompts = raw_prompts
+    elif prompt_text:
+        prompts = [prompt_text]
+    else:
+        prompts = None
 
-    negative_text    = payload.get("negative_prompt", "blurry, static, low quality, deformed")
-    sampling_steps   = payload.get("sampling_steps")
-    frames_per_scene = min(int(payload.get("frames_per_scene", DEFAULT_FRAMES_PER_SCENE)), MAX_FRAMES_PER_SCENE)
-    fps              = int(payload.get("fps", DEFAULT_FPS))
-    num_scenes       = max(1, int(payload.get("num_scenes", 3)))
+    # Video length params
+    frames_per_scene = payload.get("frames_per_scene", DEFAULT_FRAMES_PER_SCENE)
+    fps              = payload.get("fps", DEFAULT_FPS)
+    num_scenes       = payload.get("num_scenes", 3)
+    sampling_steps   = payload.get("sampling_steps")
+    negative_text    = payload.get("negative_prompt")
 
-    job_id        = job.get("id", f"job_{int(time.time())}")
-    output_dir    = find_output_dir()
-    chunk_urls    = []
-    chunk_paths   = []
+    # Compute and log expected duration
+    total_frames = int(frames_per_scene) * int(num_scenes)
+    expected_seconds = total_frames / int(fps)
+    print(f"[handler] scenes={num_scenes} frames/scene={frames_per_scene} "
+          f"fps={fps} => ~{total_frames} frames => ~{expected_seconds:.0f}s "
+          f"({expected_seconds/60:.1f} min)")
 
-    total_frames   = frames_per_scene * num_scenes
-    expected_secs  = total_frames / fps
-    print(f"[handler] {num_scenes} scenes × {frames_per_scene} frames @ {fps}fps "
-          f"= {total_frames} frames = {expected_secs:.0f}s ({expected_secs/60:.1f} min)")
+    workflow = patch_workflow_inputs(
+        workflow,
+        uploaded_filename=uploaded_filename,
+        prompts=prompts,
+        negative_prompt=negative_text,
+        sampling_steps=sampling_steps,
+        frames_per_scene=frames_per_scene,
+        fps=fps,
+        num_scenes=num_scenes,
+    )
 
-    prev_sampler = None
-    prev_decode  = None
-    prev_overlap = None
+    result = submit_prompt(workflow, payload.get("client_id", "runpod"))
+    prompt_id = result.get("prompt_id")
+    if not prompt_id:
+        raise RuntimeError(f"No prompt_id from ComfyUI: {result}")
 
-    # --- Run each scene as a separate ComfyUI job ---
-    for scene_idx in range(1, num_scenes + 1):
-        pos_text = prompts[min(scene_idx - 1, len(prompts) - 1)]
-        print(f"[handler] Submitting scene {scene_idx}/{num_scenes}: {pos_text[:60]}")
+    history = wait_for_history(prompt_id)
+    outputs = extract_outputs_base64(history)
 
-        wf, vhs_id, prev_sampler, prev_decode, prev_overlap = build_scene_workflow(
-            base_workflow,
-            scene_idx=scene_idx,
-            positive_text=pos_text,
-            negative_text=negative_text,
-            frames_per_scene=frames_per_scene,
-            sampling_steps=sampling_steps,
-            uploaded_filename=uploaded_filename,
-            fps=fps,
-            prev_sampler_node=prev_sampler,
-            prev_decode_node=prev_decode,
-            prev_overlap_node=prev_overlap,
-        )
-
-        result    = submit_prompt(wf, f"runpod_{scene_idx}")
-        prompt_id = result.get("prompt_id")
-        if not prompt_id:
-            raise RuntimeError(f"Scene {scene_idx}: no prompt_id returned")
-
-        history = wait_for_history(prompt_id, timeout=14400)
-        files   = get_output_filepaths(history)
-
-        if not files:
-            raise RuntimeError(f"Scene {scene_idx}: no output files found")
-
-        # Upload chunk to HF bucket
-        chunk_path     = files[0]["filepath"]
-        chunk_filename = f"{job_id}_scene{scene_idx:02d}.mp4"
-        chunk_url      = hf_upload_file(chunk_path, chunk_filename)
-        chunk_urls.append(chunk_url)
-        chunk_paths.append(chunk_path)
-        print(f"[handler] Scene {scene_idx} uploaded: {chunk_url}")
-
-    # --- Stitch all chunks with FFmpeg ---
-    final_filename = f"{job_id}_final.mp4"
-    final_local    = os.path.join(output_dir, final_filename)
-
-    if len(chunk_paths) == 1:
-        final_local = chunk_paths[0]
-        final_filename = os.path.basename(final_local)
-    else:
-        print(f"[handler] Stitching {len(chunk_paths)} chunks with FFmpeg...")
-        ffmpeg_concat(chunk_paths, final_local, fps)
-
-    final_url = hf_upload_file(final_local, final_filename)
-    print(f"[handler] Final video: {final_url}")
-
-    return {
-        "status": "success",
-        "final_video_url": final_url,
-        "chunk_urls": chunk_urls,
-        "total_scenes": num_scenes,
-        "total_frames": total_frames,
-        "expected_duration_seconds": expected_secs,
-        "expected_duration_minutes": round(expected_secs / 60, 1),
-    }
+    return {
+        "prompt_id": prompt_id,
+        "outputs": outputs,
+        "expected_duration_seconds": expected_seconds,
+        "total_frames": total_frames,
+        "warning": None if outputs else "Job completed but no output files found.",
+    }
 
 
 runpod.serverless.start({"handler": handler})
