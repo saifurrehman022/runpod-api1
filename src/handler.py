@@ -34,6 +34,11 @@ MAX_FRAMES_PER_SCENE     = 257
 DEFAULT_FRAMES_PER_SCENE = 81
 DEFAULT_FPS              = 16
 
+# Max scenes per job before splitting into multiple jobs
+# 3 scenes = baked workflow, safe on A100 80GB
+# Beyond 3, we split into batches of 3
+SCENES_PER_JOB = 3
+
 _comfy_ready = False
 
 
@@ -122,6 +127,18 @@ def fetch_image_from_url(url: str, filename: str = "input_image.png") -> str:
     return upload_resp.json().get("name", filename)
 
 
+def upload_image_bytes_to_comfy(image_bytes: bytes, filename: str) -> str:
+    """Upload raw image bytes directly to ComfyUI input."""
+    resp = requests.post(
+        f"{COMFY_BASE}/upload/image",
+        files={"image": (filename, image_bytes, "image/png")},
+        data={"overwrite": "true"},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json().get("name", filename)
+
+
 def upload_images_to_comfy(images):
     uploaded = []
     for img in images:
@@ -202,87 +219,119 @@ def get_output_filepaths(history):
 
 
 def workflow_has_output_node(workflow):
-    # Support structural API format checking
-    if "nodes" in workflow:
-        return any(node.get("type") in OUTPUT_NODE_TYPES for node in workflow["nodes"] if isinstance(node, dict))
-    return any(isinstance(node, dict) and node.get("class_type") in OUTPUT_NODE_TYPES for node in workflow.values())
+    return any(
+        isinstance(node, dict) and node.get("class_type") in OUTPUT_NODE_TYPES
+        for node in workflow.values()
+    )
+
+
+def extract_last_frame(video_path: str, output_path: str):
+    """Extract last frame from video using FFmpeg."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-sseof", "-1",
+        "-i", video_path,
+        "-vframes", "1",
+        "-q:v", "1",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg frame extract failed: {result.stderr}")
+    return output_path
 
 
 # ===========================================================================
-# DYNAMIC CONTINUOUS WORKFLOW GENERATION
+# WORKFLOW BUILDING
+# Exactly mirrors the 3-scene workflow pattern for any number of scenes.
+# Each batch of 3 scenes runs as one job, using the EXACT same node structure
+# as the baked workflow (193:xxx → 181:xxx → 203:xxx pattern).
 # ===========================================================================
 
-def build_single_scene_workflow(base_workflow, positive_text, negative_text,
-                                 frames_per_scene, sampling_steps,
-                                 uploaded_filename, fps, scene_idx, last_scene_history=None):
+def build_batch_workflow(base_workflow, scene_prompts, negative_text,
+                         frames_per_scene, sampling_steps,
+                         uploaded_filename, fps, batch_start_idx):
     """
-    Builds single scene steps while handling continuous dependencies dynamically.
-    Instead of hardcoding 193:xxx prefixes, it finds target functional configurations
-    by checking their true 'class_type' properties.
+    Build a workflow for up to 3 scenes using the exact baked workflow pattern.
+    scene_prompts: list of 1, 2, or 3 prompt strings for this batch.
+    batch_start_idx: global scene index of first scene in this batch (for seed variation).
     """
-    # Convert UI workflow formats to API maps if necessary
-    if "nodes" in base_workflow:
-        api_wf = {}
-        for node in base_workflow["nodes"]:
-            nid = str(node["id"])
-            api_wf[nid] = {
-                "class_type": node["type"],
-                "inputs": {k: v for k, v in node.get("widgets_values", {}).items()} if isinstance(node.get("widgets_values"), dict) else {}
-            }
-        wf = api_wf
+    wf = copy.deepcopy(base_workflow)
+    n  = len(scene_prompts)  # 1, 2, or 3
+
+    # Patch LoadImage
+    if uploaded_filename:
+        for nid, node in wf.items():
+            if isinstance(node, dict) and node.get("class_type") == "LoadImage":
+                node["inputs"]["image"] = uploaded_filename
+
+    # Patch steps
+    if sampling_steps:
+        for nid, node in wf.items():
+            if isinstance(node, dict) and node.get("class_type") == "BasicScheduler":
+                node["inputs"]["steps"] = int(sampling_steps)
+
+    # Vary seeds per batch so scenes look different
+    wf["189"]["inputs"]["noise_seed"] = 43 + batch_start_idx
+    wf["182"]["inputs"]["noise_seed"] = 44 + batch_start_idx
+    wf["199"]["inputs"]["noise_seed"] = 45 + batch_start_idx
+
+    # Always patch scene 1 (193:xxx)
+    wf["193:211"]["inputs"]["text"] = scene_prompts[0]
+    wf["193:209"]["inputs"]["text"] = negative_text
+    wf["193:215"]["inputs"]["length"] = frames_per_scene
+    wf["193:215"]["inputs"]["motion_latent_count"] = 0
+
+    if n == 1:
+        # Only scene 1 — wire VHS directly to 193:217
+        wf["204"]["inputs"]["images"] = ["193:217", 0]
+        wf["204"]["inputs"]["frame_rate"] = fps
+        # Remove scene 2 and 3 nodes
+        to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
+        for k in to_remove:
+            del wf[k]
+
+    elif n == 2:
+        # Scene 1 + Scene 2
+        wf["181:152"]["inputs"]["text"] = scene_prompts[1]
+        wf["181:206"]["inputs"]["text"] = negative_text
+        wf["181:160"]["inputs"]["length"] = frames_per_scene
+        wf["181:160"]["inputs"]["motion_latent_count"] = 1
+        # Scene 2 prev_samples from scene 1 sampler
+        wf["181:160"]["inputs"]["prev_samples"] = ["193:216", 0]
+        # Overlap: source=scene1 decode, new=scene2 decode
+        wf["181:168"]["inputs"]["source_images"] = ["193:217", 0]
+        wf["181:168"]["inputs"]["new_images"]    = ["181:162", 0]
+        # VHS from scene 2 overlap
+        wf["204"]["inputs"]["images"] = ["181:168", 0]
+        wf["204"]["inputs"]["frame_rate"] = fps
+        # Remove scene 3 nodes
+        to_remove = [k for k in wf if k.startswith("203:")]
+        for k in to_remove:
+            del wf[k]
+
     else:
-        wf = copy.deepcopy(base_workflow)
+        # All 3 scenes — exact baked workflow structure
+        wf["181:152"]["inputs"]["text"] = scene_prompts[1]
+        wf["181:206"]["inputs"]["text"] = negative_text
+        wf["181:160"]["inputs"]["length"] = frames_per_scene
+        wf["181:160"]["inputs"]["motion_latent_count"] = 1
+        wf["181:160"]["inputs"]["prev_samples"] = ["193:216", 0]
+        wf["181:168"]["inputs"]["source_images"] = ["193:217", 0]
+        wf["181:168"]["inputs"]["new_images"]    = ["181:162", 0]
 
-    # 1. Update Core Context Parameters
-    for nid, node in wf.items():
-        if not isinstance(node, dict):
-            continue
-        
-        cls = node.get("class_type")
-        
-        # Inject positive prompts dynamically
-        if cls in ("WanTextConditioning", "CLIPTextEncode") and "positive" in str(node.get("_meta", {}).get("title", "")).lower():
-            node["inputs"]["text"] = positive_text
-        elif cls in ("WanTextConditioning", "CLIPTextEncode") and "negative" in str(node.get("_meta", {}).get("title", "")).lower():
-            node["inputs"]["text"] = negative_text
-            
-        # Manage framework sequence configurations
-        if cls == "WanImageToVideoSVIPro":
-            node["inputs"]["length"] = int(frames_per_scene)
-            
-        if cls == "BasicScheduler" and sampling_steps:
-            node["inputs"]["steps"] = int(sampling_steps)
-            
-        if cls == "RandomNoise":
-            node["inputs"]["noise_seed"] = 43 + scene_idx
+        wf["203:222"]["inputs"]["text"] = scene_prompts[2]
+        wf["203:220"]["inputs"]["text"] = negative_text
+        wf["203:219"]["inputs"]["length"] = frames_per_scene
+        wf["203:219"]["inputs"]["motion_latent_count"] = 1
+        wf["203:219"]["inputs"]["prev_samples"] = ["181:208", 0]
+        wf["203:227"]["inputs"]["source_images"] = ["181:168", 0]
+        wf["203:227"]["inputs"]["new_images"]    = ["203:218", 0]
 
-        if cls == "VHS_VideoCombine":
-            node["inputs"]["frame_rate"] = fps
-            node["inputs"]["filename_prefix"] = f"scene_{scene_idx:02d}"
+        wf["204"]["inputs"]["images"] = ["203:227", 0]
+        wf["204"]["inputs"]["frame_rate"] = fps
 
-    # 2. Wire continuity pipeline structure 
-    if scene_idx == 1:
-        # Scene 1: Wire up the initial uploaded layout image reference file
-        if uploaded_filename:
-            for nid, node in wf.items():
-                if isinstance(node, dict) and node.get("class_type") == "LoadImage":
-                    node["inputs"]["image"] = uploaded_filename
-    else:
-        # Scenes 2+: Locate the previous generation's output latent or image map tensor nodes
-        if last_scene_history and "outputs" in last_scene_history:
-            # Locate target latent parameters to forward downstream
-            outputs = last_scene_history["outputs"]
-            last_node_id = list(outputs.keys())[0] # Grabs final output generation node target reference
-            
-            for nid, node in wf.items():
-                if isinstance(node, dict) and node.get("class_type") == "GetNode" and node["inputs"].get("value") == "anchor_samples":
-                    # Bypass static loading and point directly into the historical context mapping structure
-                    node["class_type"] = "GetHistoryTensor" # Redirect hook instance tracking properties
-                    node["inputs"] = {
-                        "prompt_id": last_scene_history.get("prompt_id"),
-                        "node_id": last_node_id,
-                        "output_index": 0
-                    }
+    wf["204"]["inputs"]["filename_prefix"] = f"batch_{batch_start_idx:02d}"
 
     return wf
 
@@ -296,12 +345,10 @@ def ffmpeg_concat(video_paths: list, output_path: str):
         for vp in video_paths:
             f.write(f"file '{os.path.abspath(vp)}'\n")
         list_file = f.name
-
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
            "-i", list_file, "-c", "copy", output_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     os.unlink(list_file)
-
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg stitch failed: {result.stderr}")
     return output_path
@@ -335,7 +382,7 @@ def handler(job):
 
     uploaded_filename = resolve_input_image(payload)
 
-    # Prompts setup
+    # Prompts
     raw_prompts = payload.get("prompts")
     prompt_text = payload.get("prompt_text") or payload.get("prompt")
     if raw_prompts and isinstance(raw_prompts, list):
@@ -349,7 +396,7 @@ def handler(job):
     sampling_steps   = payload.get("sampling_steps")
     frames_per_scene = min(int(payload.get("frames_per_scene", DEFAULT_FRAMES_PER_SCENE)), MAX_FRAMES_PER_SCENE)
     fps              = int(payload.get("fps", DEFAULT_FPS))
-    num_scenes       = max(1, int(payload.get("num_scenes", 10))) # Defaults cleanly to your 10 scenes layout
+    num_scenes       = max(1, int(payload.get("num_scenes", 3)))
 
     job_id      = job.get("id", f"job_{int(time.time())}")
     output_dir  = find_output_dir()
@@ -358,60 +405,85 @@ def handler(job):
 
     total_frames  = frames_per_scene * num_scenes
     expected_secs = total_frames / fps
-    print(f"[handler] Running consecutive sequence: {num_scenes} scenes.")
+    print(f"[handler] {num_scenes} scenes x {frames_per_scene} frames @ {fps}fps "
+          f"= {total_frames} frames = {expected_secs:.0f}s ({expected_secs/60:.1f} min)")
 
-    last_scene_history = None
+    # Split scenes into batches of SCENES_PER_JOB (3)
+    # Each batch runs as one ComfyUI job using the exact 3-scene workflow pattern
+    scene_idx = 0
+    batch_num = 0
 
-    # Iterative Continuous Generation Loop
-    for scene_idx in range(1, num_scenes + 1):
-        pos_text = prompts[min(scene_idx - 1, len(prompts) - 1)]
-        print(f"[handler] Processing Scene {scene_idx}/{num_scenes}...")
+    while scene_idx < num_scenes:
+        batch_num += 1
+        batch_size   = min(SCENES_PER_JOB, num_scenes - scene_idx)
+        batch_scenes = list(range(scene_idx + 1, scene_idx + batch_size + 1))
 
-        wf = build_single_scene_workflow(
+        # Get prompts for this batch
+        batch_prompts = [
+            prompts[min(i - 1, len(prompts) - 1)]
+            for i in batch_scenes
+        ]
+
+        print(f"[handler] Batch {batch_num}: scenes {batch_scenes} "
+              f"prompts={[p[:40] for p in batch_prompts]}")
+
+        wf = build_batch_workflow(
             base_workflow,
-            positive_text=pos_text,
+            scene_prompts=batch_prompts,
             negative_text=negative_text,
             frames_per_scene=frames_per_scene,
             sampling_steps=sampling_steps,
             uploaded_filename=uploaded_filename,
             fps=fps,
-            scene_idx=scene_idx,
-            last_scene_history=last_scene_history # Track and inject previous output state
+            batch_start_idx=scene_idx,
         )
 
-        result    = submit_prompt(wf, f"runpod_s{scene_idx}")
+        result    = submit_prompt(wf, f"runpod_b{batch_num}")
         prompt_id = result.get("prompt_id")
         if not prompt_id:
-            raise RuntimeError(f"Scene {scene_idx}: no prompt_id returned")
+            raise RuntimeError(f"Batch {batch_num}: no prompt_id returned")
 
         history = wait_for_history(prompt_id, timeout=14400)
-        
-        # Save current scene context information for consumption by the next iterative scene step
-        last_scene_history = history
-        last_scene_history["prompt_id"] = prompt_id
-        
-        files = get_output_filepaths(history)
+        files   = get_output_filepaths(history)
+
         if not files:
-            raise RuntimeError(f"Scene {scene_idx}: no output files found")
+            raise RuntimeError(f"Batch {batch_num}: no output files found")
 
         chunk_path     = files[0]["filepath"]
-        chunk_filename = f"{job_id}_scene{scene_idx:02d}.mp4"
+        chunk_filename = f"{job_id}_batch{batch_num:02d}.mp4"
         chunk_url      = supabase_upload(chunk_path, chunk_filename)
         chunk_urls.append(chunk_url)
         chunk_paths.append(chunk_path)
+        print(f"[handler] Batch {batch_num} done -> {chunk_url}")
 
-    # FFmpeg stitch all chunks into one final video
+        # Extract last frame and use as input image for next batch
+        # This ensures visual continuity between batches
+        if scene_idx + batch_size < num_scenes:
+            last_frame_path = os.path.join(output_dir, f"last_frame_b{batch_num}.png")
+            try:
+                extract_last_frame(chunk_path, last_frame_path)
+                uploaded_filename = upload_image_bytes_to_comfy(
+                    open(last_frame_path, "rb").read(),
+                    f"last_frame_b{batch_num}.png"
+                )
+                print(f"[handler] Last frame extracted -> {uploaded_filename} (input for next batch)")
+            except Exception as e:
+                print(f"[handler] WARNING: Could not extract last frame: {e}. Using original image.")
+
+        scene_idx += batch_size
+
+    # FFmpeg stitch all batch chunks into final video
     if len(chunk_paths) == 1:
         final_local    = chunk_paths[0]
         final_filename = os.path.basename(final_local)
     else:
-        print(f"[handler] Stitching {len(chunk_paths)} chunks together...")
+        print(f"[handler] Stitching {len(chunk_paths)} batch chunks with FFmpeg...")
         final_filename = f"{job_id}_final.mp4"
         final_local    = os.path.join(output_dir, final_filename)
         ffmpeg_concat(chunk_paths, final_local)
 
     final_url = supabase_upload(final_local, final_filename)
-    print(f"[handler] Final continuous output video: {final_url}")
+    print(f"[handler] Final video -> {final_url}")
 
     return {
         "status":                    "success",
@@ -420,6 +492,7 @@ def handler(job):
         "total_scenes":              num_scenes,
         "total_frames":              total_frames,
         "expected_duration_seconds": round(expected_secs),
+        "expected_duration_minutes": round(expected_secs / 60, 1),
     }
 
 
