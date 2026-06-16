@@ -1,3 +1,4 @@
+
 import os
 import time
 import json
@@ -443,7 +444,7 @@ def handler(job):
         if not prompt_id:
             raise RuntimeError(f"Batch {batch_num}: no prompt_id returned")
 
-        history = wait_for_history(prompt_id, timeout=14400)
+        history = wait_for_history(prompt_id, timeout=14400000000)
         files   = get_output_filepaths(history)
 
         if not files:
