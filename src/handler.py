@@ -181,7 +181,7 @@ def submit_prompt(prompt, client_id="runpod"):
     return r.json()
 
 
-def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400):
+def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400000000):
     start = time.time()
     while time.time() - start < timeout:
         try:
