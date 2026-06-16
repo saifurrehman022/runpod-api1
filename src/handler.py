@@ -1,4 +1,3 @@
-
 import os
 import time
 import json
@@ -34,11 +33,7 @@ OUTPUT_NODE_TYPES = {
 MAX_FRAMES_PER_SCENE     = 257
 DEFAULT_FRAMES_PER_SCENE = 81
 DEFAULT_FPS              = 16
-
-# Max scenes per job before splitting into multiple jobs
-# 3 scenes = baked workflow, safe on A100 80GB
-# Beyond 3, we split into batches of 3
-SCENES_PER_JOB = 3
+SCENES_PER_JOB           = 3
 
 _comfy_ready = False
 
@@ -129,7 +124,6 @@ def fetch_image_from_url(url: str, filename: str = "input_image.png") -> str:
 
 
 def upload_image_bytes_to_comfy(image_bytes: bytes, filename: str) -> str:
-    """Upload raw image bytes directly to ComfyUI input."""
     resp = requests.post(
         f"{COMFY_BASE}/upload/image",
         files={"image": (filename, image_bytes, "image/png")},
@@ -227,7 +221,6 @@ def workflow_has_output_node(workflow):
 
 
 def extract_last_frame(video_path: str, output_path: str):
-    """Extract last frame from video using FFmpeg."""
     cmd = [
         "ffmpeg", "-y",
         "-sseof", "-1",
@@ -244,75 +237,69 @@ def extract_last_frame(video_path: str, output_path: str):
 
 # ===========================================================================
 # WORKFLOW BUILDING
-# Exactly mirrors the 3-scene workflow pattern for any number of scenes.
-# Each batch of 3 scenes runs as one job, using the EXACT same node structure
-# as the baked workflow (193:xxx → 181:xxx → 203:xxx pattern).
+# Fixed bug to ensure that multi-scene batches do not get pruned down to Scene 1
 # ===========================================================================
 
 def build_batch_workflow(base_workflow, scene_prompts, negative_text,
                          frames_per_scene, sampling_steps,
                          uploaded_filename, fps, batch_start_idx):
-    """
-    Build a workflow for up to 3 scenes using the exact baked workflow pattern.
-    scene_prompts: list of 1, 2, or 3 prompt strings for this batch.
-    batch_start_idx: global scene index of first scene in this batch (for seed variation).
-    """
     wf = copy.deepcopy(base_workflow)
-    n  = len(scene_prompts)  # 1, 2, or 3
+    n  = len(scene_prompts)  # Can be 1, 2, or 3
 
-    # Patch LoadImage
+    # Patch LoadImage if an image exists
     if uploaded_filename:
         for nid, node in wf.items():
             if isinstance(node, dict) and node.get("class_type") == "LoadImage":
                 node["inputs"]["image"] = uploaded_filename
 
-    # Patch steps
+    # Patch scheduler steps
     if sampling_steps:
         for nid, node in wf.items():
             if isinstance(node, dict) and node.get("class_type") == "BasicScheduler":
                 node["inputs"]["steps"] = int(sampling_steps)
 
-    # Vary seeds per batch so scenes look different
+    # Vary noise seeds per batch run
     wf["189"]["inputs"]["noise_seed"] = 43 + batch_start_idx
     wf["182"]["inputs"]["noise_seed"] = 44 + batch_start_idx
     wf["199"]["inputs"]["noise_seed"] = 45 + batch_start_idx
 
-    # Always patch scene 1 (193:xxx)
+    # --- ALWAYS CONFIGURE SCENE 1 (Nodes 193:xxx) ---
     wf["193:211"]["inputs"]["text"] = scene_prompts[0]
     wf["193:209"]["inputs"]["text"] = negative_text
     wf["193:215"]["inputs"]["length"] = frames_per_scene
     wf["193:215"]["inputs"]["motion_latent_count"] = 0
 
     if n == 1:
-        # Only scene 1 — wire VHS directly to 193:217
+        # Route final video output directly to the end of Scene 1
         wf["204"]["inputs"]["images"] = ["193:217", 0]
         wf["204"]["inputs"]["frame_rate"] = fps
-        # Remove scene 2 and 3 nodes
+        
+        # Safe to remove unused Scene 2 and 3 blocks
         to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
         for k in to_remove:
             del wf[k]
 
     elif n == 2:
-        # Scene 1 + Scene 2
+        # --- CONFIGURE SCENE 2 (Nodes 181:xxx) ---
         wf["181:152"]["inputs"]["text"] = scene_prompts[1]
         wf["181:206"]["inputs"]["text"] = negative_text
         wf["181:160"]["inputs"]["length"] = frames_per_scene
         wf["181:160"]["inputs"]["motion_latent_count"] = 1
-        # Scene 2 prev_samples from scene 1 sampler
         wf["181:160"]["inputs"]["prev_samples"] = ["193:216", 0]
-        # Overlap: source=scene1 decode, new=scene2 decode
         wf["181:168"]["inputs"]["source_images"] = ["193:217", 0]
         wf["181:168"]["inputs"]["new_images"]    = ["181:162", 0]
-        # VHS from scene 2 overlap
+        
+        # Route final video output directly to the end of Scene 2
         wf["204"]["inputs"]["images"] = ["181:168", 0]
         wf["204"]["inputs"]["frame_rate"] = fps
-        # Remove scene 3 nodes
+        
+        # Safe to remove unused Scene 3 blocks
         to_remove = [k for k in wf if k.startswith("203:")]
         for k in to_remove:
             del wf[k]
 
     else:
-        # All 3 scenes — exact baked workflow structure
+        # --- CONFIGURE SCENE 2 (Nodes 181:xxx) ---
         wf["181:152"]["inputs"]["text"] = scene_prompts[1]
         wf["181:206"]["inputs"]["text"] = negative_text
         wf["181:160"]["inputs"]["length"] = frames_per_scene
@@ -321,6 +308,7 @@ def build_batch_workflow(base_workflow, scene_prompts, negative_text,
         wf["181:168"]["inputs"]["source_images"] = ["193:217", 0]
         wf["181:168"]["inputs"]["new_images"]    = ["181:162", 0]
 
+        # --- CONFIGURE SCENE 3 (Nodes 203:xxx) ---
         wf["203:222"]["inputs"]["text"] = scene_prompts[2]
         wf["203:220"]["inputs"]["text"] = negative_text
         wf["203:219"]["inputs"]["length"] = frames_per_scene
@@ -329,11 +317,11 @@ def build_batch_workflow(base_workflow, scene_prompts, negative_text,
         wf["203:227"]["inputs"]["source_images"] = ["181:168", 0]
         wf["203:227"]["inputs"]["new_images"]    = ["203:218", 0]
 
+        # Route video combiner directly to the complete 3-scene structural output
         wf["204"]["inputs"]["images"] = ["203:227", 0]
         wf["204"]["inputs"]["frame_rate"] = fps
 
     wf["204"]["inputs"]["filename_prefix"] = f"batch_{batch_start_idx:02d}"
-
     return wf
 
 
@@ -383,7 +371,7 @@ def handler(job):
 
     uploaded_filename = resolve_input_image(payload)
 
-    # Prompts
+    # Setup the prompt queues
     raw_prompts = payload.get("prompts")
     prompt_text = payload.get("prompt_text") or payload.get("prompt")
     if raw_prompts and isinstance(raw_prompts, list):
@@ -409,8 +397,6 @@ def handler(job):
     print(f"[handler] {num_scenes} scenes x {frames_per_scene} frames @ {fps}fps "
           f"= {total_frames} frames = {expected_secs:.0f}s ({expected_secs/60:.1f} min)")
 
-    # Split scenes into batches of SCENES_PER_JOB (3)
-    # Each batch runs as one ComfyUI job using the exact 3-scene workflow pattern
     scene_idx = 0
     batch_num = 0
 
@@ -419,7 +405,6 @@ def handler(job):
         batch_size   = min(SCENES_PER_JOB, num_scenes - scene_idx)
         batch_scenes = list(range(scene_idx + 1, scene_idx + batch_size + 1))
 
-        # Get prompts for this batch
         batch_prompts = [
             prompts[min(i - 1, len(prompts) - 1)]
             for i in batch_scenes
@@ -444,6 +429,7 @@ def handler(job):
         if not prompt_id:
             raise RuntimeError(f"Batch {batch_num}: no prompt_id returned")
 
+        # Explicit long-polling tracker utilizing prompt_id
         history = wait_for_history(prompt_id, timeout=14400000000)
         files   = get_output_filepaths(history)
 
@@ -457,8 +443,7 @@ def handler(job):
         chunk_paths.append(chunk_path)
         print(f"[handler] Batch {batch_num} done -> {chunk_url}")
 
-        # Extract last frame and use as input image for next batch
-        # This ensures visual continuity between batches
+        # Continuity hook using frame generation sequences
         if scene_idx + batch_size < num_scenes:
             last_frame_path = os.path.join(output_dir, f"last_frame_b{batch_num}.png")
             try:
@@ -473,7 +458,7 @@ def handler(job):
 
         scene_idx += batch_size
 
-    # FFmpeg stitch all batch chunks into final video
+    # Final Compilation
     if len(chunk_paths) == 1:
         final_local    = chunk_paths[0]
         final_filename = os.path.basename(final_local)
