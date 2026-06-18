@@ -25,8 +25,8 @@ OUTPUT_NODE_TYPES = {
     "SaveImage", "SaveAnimatedWEBP", "SaveAnimatedPNG",
     "SaveAnimatedGIF", "SaveVideo", "VHS_VideoCombine", "PreviewImage",
 }
-MAX_FRAMES_PER_SCENE     = 257
-DEFAULT_FRAMES_PER_SCENE = 81
+MAX_FRAMES_PER_SCENE     = 300
+DEFAULT_FRAMES_PER_SCENE = 257
 DEFAULT_FPS              = 16
 SCENES_PER_JOB           = 3
 _comfy_ready = False
