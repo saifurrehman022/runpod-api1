@@ -30,8 +30,8 @@ OUTPUT_NODE_TYPES = {
     "SaveAnimatedGIF", "SaveVideo", "VHS_VideoCombine", "PreviewImage",
 }
 
-MAX_FRAMES_PER_SCENE     = 257
-DEFAULT_FRAMES_PER_SCENE = 81
+MAX_FRAMES_PER_SCENE     = 300
+DEFAULT_FRAMES_PER_SCENE = 257
 DEFAULT_FPS              = 16
 SCENES_PER_BATCH         = 3
 
