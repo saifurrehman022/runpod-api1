@@ -13,9 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1 \
     CMAKE_BUILD_PARALLEL_LEVEL=8
-# Universal GPU target architectures
-ENV TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0;12.0+PTX" \
-    NVCC_FLAGS="-gencode=arch=compute_120,code=sm_120"
+
 # ==========================
 # =============================================================================
 # Installs core Linux utilities and heavy graphics libraries required by OpenCV (cv2) and FFmpeg
