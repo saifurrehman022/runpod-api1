@@ -13,7 +13,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1 \
     CMAKE_BUILD_PARALLEL_LEVEL=8
-
+# Universal GPU target architectures
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0;12.0+PTX" \
+    NVCC_FLAGS="-gencode=arch=compute_120,code=sm_120"
 # ==========================
 # =============================================================================
 # Installs core Linux utilities and heavy graphics libraries required by OpenCV (cv2) and FFmpeg
@@ -115,7 +117,8 @@ RUN mkdir -p /comfyui/custom_nodes
 
 # Step A: Upgrade python installation managers within ComfyUI's internal workspace environment
 RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel
-
+# Force PyTorch in ComfyUI's internal workspace environment to update to a matching CUDA runtime
+RUN /comfyui/.venv/bin/python -m pip install --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 # Step B: Install exhaustive python prerequisite packages required by modern video architectures
 RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     opencv-python-headless \
