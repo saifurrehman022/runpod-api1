@@ -33,7 +33,7 @@ OUTPUT_NODE_TYPES = {
 MAX_FRAMES_PER_SCENE     = 300
 DEFAULT_FRAMES_PER_SCENE = 257
 DEFAULT_FPS              = 16
-SCENES_PER_BATCH         = 3
+SCENES_PER_BATCH         = 10
 
 _comfy_ready = False
 
