@@ -343,7 +343,7 @@ def handler(job):
             for i in batch_scenes
         ]
         print(f"[handler] Batch {batch_num}: scenes {batch_scenes} "
-              f"prompts={[p[:40] for p in batch_prompts]}")
+              f"prompts={batch_prompts}")
         wf = build_batch_workflow(
             base_workflow,
             scene_prompts=batch_prompts,
