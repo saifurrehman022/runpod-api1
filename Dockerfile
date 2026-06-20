@@ -1,16 +1,12 @@
-ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 FROM ${BASE_IMAGE} AS base
-
-ARG COMFYUI_VERSION=
-ARG ENABLE_PYTORCH_UPGRADE=false
-ARG PYTORCH_INDEX_URL
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1 \
     CMAKE_BUILD_PARALLEL_LEVEL=8 \
     PIP_NO_INPUT=1
- 
+
 # =============================================================================
 # 2. SYSTEM DEPENDENCIES
 # =============================================================================
@@ -18,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
     python3.12-dev \
+    python3-pip \
     git \
     wget \
     curl \
@@ -30,43 +27,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3
 
 # =============================================================================
-# 3. FAST PYTHON ENVIRONMENT WITH UV
+# 3. PYTHON ENVIRONMENT
 # =============================================================================
-RUN wget -qO- https://astral.sh/uv/install.sh | sh \
-    && ln -s /root/.local/bin/uv /usr/local/bin/uv \
-    && ln -s /root/.local/bin/uvx /usr/local/bin/uvx
-
-# Create the primary virtual environment that everything will run from
-RUN mkdir -p /comfyui
-RUN uv venv /comfyui/.venv
+# Create venv WITH pip (--seed ensures pip is installed inside venv)
+RUN python3.12 -m venv /comfyui/.venv --copies
 ENV PATH="/comfyui/.venv/bin:${PATH}"
 
-# Install runner requirements
-RUN uv pip install comfy-cli runpod requests websocket-client
+# Upgrade pip inside the venv
+RUN /comfyui/.venv/bin/python -m pip install --upgrade pip setuptools wheel
+
+# Install runner + ComfyUI CLI
+RUN /comfyui/.venv/bin/python -m pip install comfy-cli runpod requests websocket-client
 
 # =============================================================================
-# 4. COMFYUI & TARGET PYTORCH INSTALLATION (Robust Git Pass)
+# 4. PYTORCH FOR RTX 5090 (Blackwell — CUDA 12.8)
 # =============================================================================
-# =============================================================================
-# 4. COMFYUI & TARGET BLACKWELL-COMPATIBLE PYTORCH INSTALLATION
-# =============================================================================
-# Install stable PyTorch wheels compiled for CUDA 12.8 (Blackwell Support)
-RUN uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+RUN /comfyui/.venv/bin/python -m pip install --force-reinstall \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
 
-# Clone ComfyUI repository directly
+# =============================================================================
+# 5. COMFYUI INSTALLATION
+# =============================================================================
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /comfyui/ComfyUI
-
-# Install core ComfyUI dependencies natively into our active environment
-RUN uv pip install -r /comfyui/ComfyUI/requirements.txt
+RUN /comfyui/.venv/bin/python -m pip install -r /comfyui/ComfyUI/requirements.txt
 
 ENV COMFYUI_DIR=/comfyui
 WORKDIR /
 
 # =============================================================================
-# 5. RUNPOD INFRASTRUCTURE
+# 6. RUNPOD INFRASTRUCTURE
 # =============================================================================
 ADD src/extra_model_paths.yaml /comfyui/extra_model_paths.yaml
 ADD src/extra_model_paths.yaml /comfyui/ComfyUI/extra_model_paths.yaml
@@ -82,17 +76,10 @@ COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
 # =============================================================================
-# 6. CUSTOM NODES DEPENDENCIES (Speed optimized via UV)
+# 7. CUSTOM NODES PYTHON DEPENDENCIES
 # =============================================================================
+RUN mkdir -p /comfyui/ComfyUI/custom_nodes
 
-
-RUN mkdir -p /comfyui/custom_nodes
-
-# Step A: Upgrade python installation managers within ComfyUI's internal workspace environment
-RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel
-# Force PyTorch in ComfyUI's internal workspace environment to update to a matching CUDA runtime
-RUN /comfyui/.venv/bin/python -m pip install --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-# Step B: Install exhaustive python prerequisite packages required by modern video architectures
 RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     opencv-python-headless \
     imageio-ffmpeg \
@@ -109,118 +96,132 @@ RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     matplotlib \
     mss \
     onnxruntime-gpu \
-    transformers\
-    sageattention
+    transformers \
+    sageattention \
+    sympy
 
-# Step C: Clone Required Custom Nodes and check for internal secondary dependencies
-# Clone KJNodes (Handles core math logic, image transformations, and structural loaders)
-RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
+# KJNodes — core math, loaders, image transforms
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git \
+    /comfyui/ComfyUI/custom_nodes/ComfyUI-KJNodes && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir \
+            -r /comfyui/ComfyUI/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
     fi
 
-# Clone VideoHelperSuite (Provides video compilation, tracking arrays, and frames extraction hooks)
-RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
+# VideoHelperSuite — VHS_VideoCombine node
+RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
+    /comfyui/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir \
+            -r /comfyui/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
     fi
 
-# Clone WanVideoWrapper (Implements foundational wrappers for running the WanVideo model suite natively)
-RUN git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git /comfyui/custom_nodes/ComfyUI-WanVideoWrapper && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
+# WanVideoWrapper — DiffusionModelLoaderKJ, WanImageToVideoSVIPro, etc.
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git \
+    /comfyui/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir \
+            -r /comfyui/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
     fi
 
-# Clone Logic Nodes (Provides SetNode/GetNode primitives to process non-linear global variable graphs)
-RUN git clone --depth 1 https://github.com/theUpsider/ComfyUI-Logic.git /comfyui/custom_nodes/ComfyUI-Logic && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt; \
+# ComfyUI-Logic — SetNode / GetNode primitives
+RUN git clone --depth 1 https://github.com/theUpsider/ComfyUI-Logic.git \
+    /comfyui/ComfyUI/custom_nodes/ComfyUI-Logic && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-Logic/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir \
+            -r /comfyui/ComfyUI/custom_nodes/ComfyUI-Logic/requirements.txt; \
     fi
-RUN git clone --depth 1 https://github.com/Well-Made/ComfyUI-Wan-SVI2Pro-FLF.git /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt; \
+
+# SVI Pro FLF — WanImageToVideoSVIPro node
+RUN git clone --depth 1 https://github.com/Well-Made/ComfyUI-Wan-SVI2Pro-FLF.git \
+    /comfyui/ComfyUI/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir \
+            -r /comfyui/ComfyUI/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt; \
     fi
-# =============================================================================
-# 7. MODEL DOWNLOAD LAYER (WITH RE-TRY BACKOFF LOOP STRATEGY)
-# =============================================================================
-# Note: Every command runs a looped sequence of up to 5 attempts with incremental backoffs (10s -> 20s -> 30s...) 
-# to shield the image build from random Hugging Face connection drops.
-
-# --- LORAS ---
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
-    comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Wan22_Lightx2v/Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_v1030_rank_64_bf16.safetensors' \
-      --relative-path models/loras \
-      --filename 'Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_v1030_rank_64_bf16.safetensors' && break; \
-    if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
-    SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
-
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
-    comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Stable-Video-Infinity/v2.0/SVI_v2_PRO_Wan2.2-I2V-A14B_HIGH_lora_rank_128_fp16.safetensors' \
-      --relative-path models/loras \
-      --filename 'SVI_v2_PRO_Wan2.2-I2V-A14B_HIGH_lora_rank_128_fp16.safetensors' && break; \
-    if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
-    SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
-
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
-    comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors' \
-      --relative-path models/loras \
-      --filename 'lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors' && break; \
-    if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
-    SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
-
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
-    comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Stable-Video-Infinity/v2.0/SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors' \
-      --relative-path models/loras \
-      --filename 'SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors' && break; \
-    if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
-    SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
-
-# --- TEXT ENCODERS ---
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
-    comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors' \
-      --relative-path models/text_encoders \
-      --filename 'umt5_xxl_fp8_e4m3fn_scaled.safetensors' && break; \
-    if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
-    SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
-
-# --- VAE ---
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
-    comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors' \
-      --relative-path models/vae \
-      --filename 'Wan2_1_VAE_bf16.safetensors' && break; \
-    if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
-    SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
-# --- DIFFUSION MODELS ---
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
-    comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors' \
-      --relative-path models/diffusion_models \
-      --filename 'Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors' && break; \
-    if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
-    SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
-
-RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
-    comfy --workspace /comfyui model download \
-      --url 'https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors' \
-      --relative-path models/diffusion_models \
-      --filename 'Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors' && break; \
-    if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
-    SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
 
 # =============================================================================
-# 8. INPUT ASSET SEEDING & ENTRYPOINT RUNTIME
+# 8. MODEL DOWNLOADS (retry loop — up to 5 attempts with backoff)
 # =============================================================================
-# Generate baseline input file paths and seed the default initialization source image
-RUN mkdir -p /comfyui/input
-RUN wget --progress=dot:giga \
-    -O '/comfyui/input/Gemini_Generated_Image_jk7o1njk7o1njk7o.png' \
-    "https://cool-anteater-319.convex.cloud/api/storage/0c172877-f42a-4fa0-89ea-d40d82991fa6"
+RUN mkdir -p /comfyui/ComfyUI/models/diffusion_models \
+             /comfyui/ComfyUI/models/loras \
+             /comfyui/ComfyUI/models/text_encoders \
+             /comfyui/ComfyUI/models/vae \
+             /comfyui/ComfyUI/models/clip_vision
 
-# Setup the RunPod entrypoint file execution array
+# Helper: retry wget
+SHELL ["/bin/bash", "-c"]
+
+# Diffusion model HIGH
+RUN for i in 1 2 3 4 5; do \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/models/diffusion_models/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors \
+      https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors \
+      && break || { echo "Retry $i..."; sleep $((i*15)); }; \
+    done
+
+# Diffusion model LOW
+RUN for i in 1 2 3 4 5; do \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/models/diffusion_models/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors \
+      https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/I2V/Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors \
+      && break || { echo "Retry $i..."; sleep $((i*15)); }; \
+    done
+
+# LoRA — Lightx2v HIGH noise
+RUN for i in 1 2 3 4 5; do \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/models/loras/Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_v1030_rank_64_bf16.safetensors \
+      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Wan22_Lightx2v/Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_v1030_rank_64_bf16.safetensors \
+      && break || { echo "Retry $i..."; sleep $((i*15)); }; \
+    done
+
+# LoRA — Lightx2v LOW noise
+RUN for i in 1 2 3 4 5; do \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/models/loras/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors \
+      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors \
+      && break || { echo "Retry $i..."; sleep $((i*15)); }; \
+    done
+
+# LoRA — SVI Pro HIGH
+RUN for i in 1 2 3 4 5; do \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/models/loras/SVI_v2_PRO_Wan2.2-I2V-A14B_HIGH_lora_rank_128_fp16.safetensors \
+      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Stable-Video-Infinity/v2.0/SVI_v2_PRO_Wan2.2-I2V-A14B_HIGH_lora_rank_128_fp16.safetensors \
+      && break || { echo "Retry $i..."; sleep $((i*15)); }; \
+    done
+
+# LoRA — SVI Pro LOW
+RUN for i in 1 2 3 4 5; do \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/models/loras/SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors \
+      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Stable-Video-Infinity/v2.0/SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors \
+      && break || { echo "Retry $i..."; sleep $((i*15)); }; \
+    done
+
+# Text encoder — UMT5 XXL fp8
+RUN for i in 1 2 3 4 5; do \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
+      https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
+      && break || { echo "Retry $i..."; sleep $((i*15)); }; \
+    done
+
+# VAE
+RUN for i in 1 2 3 4 5; do \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/models/vae/Wan2_1_VAE_bf16.safetensors \
+      https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors \
+      && break || { echo "Retry $i..."; sleep $((i*15)); }; \
+    done
+
+# =============================================================================
+# 9. SEED INPUT IMAGE
+# =============================================================================
+RUN mkdir -p /comfyui/ComfyUI/input && \
+    wget -q --show-progress \
+      -O /comfyui/ComfyUI/input/first-frame.png \
+      "https://cool-anteater-319.convex.cloud/api/storage/0c172877-f42a-4fa0-89ea-d40d82991fa6"
+
 ENTRYPOINT ["/bin/bash", "/start.sh"]
