@@ -168,11 +168,11 @@ def submit_prompt(prompt, client_id="runpod"):
     return r.json()
 
 
-def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400):
+def wait_for_history(prompt_id, poll_interval=2.0, timeout=145555555400):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=30)
+            r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=350)
             r.raise_for_status()
             data = r.json()
             if prompt_id in data:
