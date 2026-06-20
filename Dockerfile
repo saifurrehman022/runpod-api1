@@ -1,22 +1,19 @@
-
 ARG BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 FROM ${BASE_IMAGE} AS base
 
-# Define build-time  --build-arg during build) 
 ARG COMFYUI_VERSION=
-ARG CUDA_VERSION_FOR_COMFY
 ARG ENABLE_PYTORCH_UPGRADE=false
 ARG PYTORCH_INDEX_URL
-
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1 \
-    CMAKE_BUILD_PARALLEL_LEVEL=8
+    CMAKE_BUILD_PARALLEL_LEVEL=8 \
+    PIP_NO_INPUT=1
 
-# ==========================
 # =============================================================================
-# Installs core Linux utilities and heavy graphics libraries required by OpenCV (cv2) and FFmpeg
+# 2. SYSTEM DEPENDENCIES
+# =============================================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
@@ -33,69 +30,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip
-# Clean up apt caches to save space and minimize final Docker image size
-RUN apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+    && ln -sf /usr/bin/python3.12 /usr/bin/python
 
 # =============================================================================
-# 3. PYTHON ENVIRONMENT MANAGEMENT (UV & CORE VENV)
+# 3. FAST PYTHON ENVIRONMENT WITH UV
 # =============================================================================
-# Download and install 'uv' (an extremely fast alternative to pip) and initialize a master venv
 RUN wget -qO- https://astral.sh/uv/install.sh | sh \
     && ln -s /root/.local/bin/uv /usr/local/bin/uv \
-    && ln -s /root/.local/bin/uvx /usr/local/bin/uvx \
-    && uv venv /opt/venv
+    && ln -s /root/.local/bin/uvx /usr/local/bin/uvx
 
-# Force the container environment to prioritize the newly created virtual environment
-ENV PATH="/opt/venv/bin:${PATH}"
+# Create the primary virtual environment that everything will run from
+RUN mkdir -p /comfyui
+RUN uv venv /comfyui/.venv
+ENV PATH="/comfyui/.venv/bin:${PATH}"
 
-# Upgrade foundational installation primitives inside the core virtual environment
-RUN /opt/venv/bin/python -m ensurepip --upgrade \
-    && /opt/venv/bin/python -m pip install --upgrade pip setuptools wheel
+# Install runner requirements
+RUN uv pip install comfy-cli runpod requests websocket-client
 
 # =============================================================================
-# 4. COMFYUI FRAMEWORK INSTALLATION
+# 4. COMFYUI & TARGET PYTORCH INSTALLATION (Robust Git Pass)
 # =============================================================================
-# Install the ComfyUI command-line utility globally inside our virtual environment
-RUN /opt/venv/bin/python -m pip install comfy-cli
+# =============================================================================
+# 4. COMFYUI & TARGET BLACKWELL-COMPATIBLE PYTORCH INSTALLATION
+# =============================================================================
+# Install stable PyTorch wheels compiled for CUDA 12.8 (Blackwell Support)
+RUN uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# Conditional installation script blocks to install ComfyUI with specified parameters
-RUN set -eux; \
-    if [ -n "${CUDA_VERSION_FOR_COMFY:-}" ]; then \
-        if [ -n "${COMFYUI_VERSION:-}" ]; then \
-            /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --cuda-version "${CUDA_VERSION_FOR_COMFY}" --nvidia; \
-        else \
-            /usr/bin/yes | comfy --workspace /comfyui install --cuda-version "${CUDA_VERSION_FOR_COMFY}" --nvidia; \
-        fi; \
-    else \
-        if [ -n "${COMFYUI_VERSION:-}" ]; then \
-            /usr/bin/yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --nvidia; \
-        else \
-            /usr/bin/yes | comfy --workspace /comfyui install --nvidia; \
-        fi; \
-    fi
+# Clone ComfyUI repository directly
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /comfyui/ComfyUI
 
-# Upgrades PyTorch if a custom index URL is specified (useful for aligning cutting-edge CUDA runtimes)
-RUN if [ "$ENABLE_PYTORCH_UPGRADE" = "true" ]; then \
-    /opt/venv/bin/python -m pip install --force-reinstall torch torchvision torchaudio --index-url ${PYTORCH_INDEX_URL}; \
-    fi
+# Install core ComfyUI dependencies natively into our active environment
+RUN uv pip install -r /comfyui/ComfyUI/requirements.txt
 
 ENV COMFYUI_DIR=/comfyui
+WORKDIR /
 
 # =============================================================================
-# 5. RUNPOD SPECIFIC INFRASTRUCTURE SETUP
+# 5. RUNPOD INFRASTRUCTURE
 # =============================================================================
-# Add custom extra model paths to direct ComfyUI's model loaders to correct structural paths
 ADD src/extra_model_paths.yaml /comfyui/extra_model_paths.yaml
 ADD src/extra_model_paths.yaml /comfyui/ComfyUI/extra_model_paths.yaml
 
-WORKDIR /
-
-# Install foundational Python infrastructure required for RunPod serverless handlers
-RUN /opt/venv/bin/python -m pip install runpod requests websocket-client
-
-# Add RunPod specific application code, server hooks, and scripts
 ADD src/start.sh src/network_volume.py src/handler.py ./
 COPY src/workflow.json /workflow.json
 RUN chmod +x /start.sh
@@ -103,14 +78,14 @@ RUN chmod +x /start.sh
 COPY scripts/comfy-node-install.sh /usr/local/bin/comfy-node-install
 RUN chmod +x /usr/local/bin/comfy-node-install
 
-ENV PIP_NO_INPUT=1
-
 COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
 # =============================================================================
-# 6. CUSTOM NODES SETUP (WANVIDEO & SVI WORKFLOW DEPENDENCIES)
+# 6. CUSTOM NODES DEPENDENCIES (Speed optimized via UV)
 # =============================================================================
+
+
 RUN mkdir -p /comfyui/custom_nodes
 
 # Step A: Upgrade python installation managers within ComfyUI's internal workspace environment
