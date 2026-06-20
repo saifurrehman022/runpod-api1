@@ -8,7 +8,6 @@ import copy
 import requests
 import runpod
 
-
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_BASE = f"http://{COMFY_HOST}:{COMFY_PORT}"
@@ -34,7 +33,7 @@ OUTPUT_NODE_TYPES = {
 MAX_FRAMES_PER_SCENE     = 257
 DEFAULT_FRAMES_PER_SCENE = 81
 DEFAULT_FPS              = 16
-SCENES_PER_BATCH         = 3  # MUST be 3 — matches the 3-scene workflow structure
+SCENES_PER_BATCH         = 3
 
 _comfy_ready = False
 
@@ -169,11 +168,11 @@ def submit_prompt(prompt, client_id="runpod"):
     return r.json()
 
 
-def wait_for_history(prompt_id, poll_interval=2.0, timeout=145555555400):
+def wait_for_history(prompt_id, poll_interval=2.0, timeout=14400):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=350)
+            r = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=30)
             r.raise_for_status()
             data = r.json()
             if prompt_id in data:
@@ -187,11 +186,6 @@ def wait_for_history(prompt_id, poll_interval=2.0, timeout=145555555400):
 
 
 def get_largest_output_file(history):
-    """
-    Always return the LARGEST output file from history.
-    Largest = final combined video containing all scenes in the batch.
-    Scene 1 alone is small. Scene 1+2+3 combined is largest.
-    """
     output_dir = find_output_dir()
     files = []
     for _, node_output in history.get("outputs", {}).items():
@@ -214,7 +208,6 @@ def get_largest_output_file(history):
     if not files:
         return None
 
-    # Sort largest first — that's the final combined scenes video
     files.sort(key=lambda x: x["size"], reverse=True)
     chosen = files[0]
     print(f"[output] Using largest: {chosen['filename']} ({chosen['size']/1024/1024:.1f} MB)")
@@ -241,9 +234,10 @@ def build_batch_workflow(base_workflow, scene_prompts, negative_text,
                          frames_per_scene, sampling_steps,
                          uploaded_filename, fps, batch_start_idx):
     """
-    Build a 1, 2, or 3 scene workflow batch.
-    SCENES_PER_BATCH=3 means each batch runs 3 scenes chained together.
-    The VHS output of a 3-scene batch contains scenes 1+2+3 combined.
+    ImageBatchExtendWithOverlap output slots:
+      slot 0 = source images only
+      slot 1 = new images only
+      slot 2 = COMBINED extended images  <-- this is what VHS must use
     """
     wf = copy.deepcopy(base_workflow)
     n  = len(scene_prompts)
@@ -272,7 +266,7 @@ def build_batch_workflow(base_workflow, scene_prompts, negative_text,
     wf["193:215"]["inputs"]["motion_latent_count"] = 0
 
     if n == 1:
-        # Only Scene 1 — VHS gets scene 1 decode output
+        # Scene 1 only — VHS gets VAEDecode output directly
         wf["204"]["inputs"]["images"] = ["193:217", 0]
         wf["204"]["inputs"]["frame_rate"] = fps
         to_remove = [k for k in wf if k.startswith("181:") or k.startswith("203:")]
@@ -288,15 +282,15 @@ def build_batch_workflow(base_workflow, scene_prompts, negative_text,
         wf["181:160"]["inputs"]["prev_samples"]  = ["193:216", 0]
         wf["181:168"]["inputs"]["source_images"] = ["193:217", 0]
         wf["181:168"]["inputs"]["new_images"]    = ["181:162", 0]
-        # VHS gets overlap output = scene1+scene2 combined
-        wf["204"]["inputs"]["images"] = ["181:168", 0]
+        # SLOT 2 = combined scene1+scene2 frames
+        wf["204"]["inputs"]["images"] = ["181:168", 2]
         wf["204"]["inputs"]["frame_rate"] = fps
         to_remove = [k for k in wf if k.startswith("203:")]
         for k in to_remove:
             del wf[k]
 
     else:
-        # Scene 1 + Scene 2 + Scene 3 chained — FULL 3-scene batch
+        # All 3 scenes chained
         wf["181:152"]["inputs"]["text"] = scene_prompts[1]
         wf["181:206"]["inputs"]["text"] = negative_text
         wf["181:160"]["inputs"]["length"] = frames_per_scene
@@ -310,10 +304,11 @@ def build_batch_workflow(base_workflow, scene_prompts, negative_text,
         wf["203:219"]["inputs"]["length"] = frames_per_scene
         wf["203:219"]["inputs"]["motion_latent_count"] = 1
         wf["203:219"]["inputs"]["prev_samples"]  = ["181:208", 0]
-        wf["203:227"]["inputs"]["source_images"] = ["181:168", 0]
+        # SLOT 2 = combined output from 181:168 (scene1+scene2)
+        wf["203:227"]["inputs"]["source_images"] = ["181:168", 2]
         wf["203:227"]["inputs"]["new_images"]    = ["203:218", 0]
-        # VHS gets final overlap = scene1+scene2+scene3 combined
-        wf["204"]["inputs"]["images"] = ["203:227", 0]
+        # SLOT 2 = combined scene1+scene2+scene3 frames
+        wf["204"]["inputs"]["images"] = ["203:227", 2]
         wf["204"]["inputs"]["frame_rate"] = fps
 
     wf["204"]["inputs"]["filename_prefix"] = f"batch_{batch_start_idx:02d}"
@@ -382,7 +377,6 @@ def handler(job):
     expected_secs = total_frames / fps
     print(f"[handler] {num_scenes} scenes x {frames_per_scene} frames @ {fps}fps "
           f"= {total_frames} frames = {expected_secs:.0f}s ({expected_secs/60:.1f} min)")
-    print(f"[handler] Running in batches of {SCENES_PER_BATCH} scenes each")
 
     scene_idx = 0
     batch_num = 0
@@ -416,7 +410,6 @@ def handler(job):
 
         history = wait_for_history(prompt_id, timeout=14400)
 
-        # Get LARGEST file — this is scenes 1+2+3 combined, not just scene 1
         chunk_path = get_largest_output_file(history)
         if not chunk_path:
             raise RuntimeError(f"Batch {batch_num}: no output files found")
@@ -442,12 +435,12 @@ def handler(job):
 
         scene_idx += batch_size
 
-    # Stitch all batch chunks into final video
+    # Stitch all batch chunks
     if len(chunk_paths) == 1:
         final_local    = chunk_paths[0]
         final_filename = os.path.basename(final_local)
     else:
-        print(f"[handler] Stitching {len(chunk_paths)} batch chunks with FFmpeg...")
+        print(f"[handler] Stitching {len(chunk_paths)} chunks...")
         final_filename = f"{job_id}_final.mp4"
         final_local    = os.path.join(output_dir, final_filename)
         ffmpeg_concat(chunk_paths, final_local)
