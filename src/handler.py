@@ -28,7 +28,7 @@ OUTPUT_NODE_TYPES = {
 MAX_FRAMES_PER_SCENE     = 300
 DEFAULT_FRAMES_PER_SCENE = 257
 DEFAULT_FPS              = 16
-SCENES_PER_JOB           = 3
+SCENES_PER_JOB           = 1
 _comfy_ready = False
 # ===========================================================================
 # SUPABASE
