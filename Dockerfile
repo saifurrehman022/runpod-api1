@@ -95,25 +95,21 @@ RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     sageattention
 
 
-# Clone KJNodes (Handles core math logic, image transformations, and structural loaders)
 RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
     if [ -f /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
     fi
 
-# Clone VideoHelperSuite (Provides video compilation, tracking arrays, and frames extraction hooks)
 RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
     if [ -f /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
     fi
 
-# Clone WanVideoWrapper (Implements foundational wrappers for running the WanVideo model suite natively)
 RUN git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git /comfyui/custom_nodes/ComfyUI-WanVideoWrapper && \
     if [ -f /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
     fi
 
-# Clone Logic Nodes (Provides SetNode/GetNode primitives to process non-linear global variable graphs)
 RUN git clone --depth 1 https://github.com/theUpsider/ComfyUI-Logic.git /comfyui/custom_nodes/ComfyUI-Logic && \
     if [ -f /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt; \
@@ -122,10 +118,7 @@ RUN git clone --depth 1 https://github.com/Well-Made/ComfyUI-Wan-SVI2Pro-FLF.git
     if [ -f /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt; \
     fi
-# =============================================================================
-# 7. MODEL DOWNLOAD LAYER (WITH RE-TRY BACKOFF LOOP STRATEGY)
-# =============================================================================
-# Note: Every command runs a looped sequence of up to 5 attempts with incremental backoffs (10s -> 20s -> 30s...) 
+
 # to shield the image build from random Hugging Face connection drops.
 
 # --- LORAS ---
