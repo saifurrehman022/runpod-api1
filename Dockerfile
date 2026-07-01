@@ -11,9 +11,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CMAKE_BUILD_PARALLEL_LEVEL=8 \
     PIP_NO_INPUT=1
  
-# =============================================================================
-# 2. SYSTEM DEPENDENCIES
-# ============================================================================
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
@@ -32,42 +30,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
 
-# =============================================================================
-# 3. FAST PYTHON ENVIRONMENT WITH UV
-# =============================================================================
+
 RUN wget -qO- https://astral.sh/uv/install.sh | sh \
     && ln -s /root/.local/bin/uv /usr/local/bin/uv \
     && ln -s /root/.local/bin/uvx /usr/local/bin/uvx
 
-# Create the primary virtual environment that everything will run from
+
 RUN mkdir -p /comfyui
 RUN uv venv /comfyui/.venv --seed
 ENV PATH="/comfyui/.venv/bin:${PATH}"
 
-# Install runner requirements
+
 RUN uv pip install comfy-cli runpod requests websocket-client
 
-# =============================================================================
-# 4. COMFYUI & TARGET PYTORCH INSTALLATION (Robust Git Pass)
-# =============================================================================
-# =============================================================================
-# 4. COMFYUI & TARGET BLACKWELL-COMPATIBLE PYTORCH INSTALLATION
-# =============================================================================
-# Install stable PyTorch wheels compiled for CUDA 12.8 (Blackwell Support)
+
 RUN uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# Clone ComfyUI repository directly
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /comfyui/ComfyUI
 
-# Install core ComfyUI dependencies natively into our active environment
 RUN uv pip install -r /comfyui/ComfyUI/requirements.txt
 
 ENV COMFYUI_DIR=/comfyui
 WORKDIR /
 
-# =============================================================================
-# 5. RUNPOD INFRASTRUCTURE
-# =============================================================================
+
 ADD src/extra_model_paths.yaml /comfyui/extra_model_paths.yaml
 ADD src/extra_model_paths.yaml /comfyui/ComfyUI/extra_model_paths.yaml
 
@@ -81,19 +67,14 @@ RUN chmod +x /usr/local/bin/comfy-node-install
 COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
-# =============================================================================
-# 6. CUSTOM NODES DEPENDENCIES (Speed optimized via UV)
-# =============================================================================
+
 
 
 RUN mkdir -p /comfyui/custom_nodes
 
-# Step A: Upgrade python installation managers within ComfyUI's internal workspace environment
 RUN uv pip install --python /comfyui/.venv/bin/python --no-cache pip setuptools wheel
 
-# Force PyTorch in ComfyUI's internal workspace environment to update to a matching CUDA runtime (cu128 for RTX 5090 Blackwell)
 RUN uv pip install --python /comfyui/.venv/bin/python --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-# Step B: Install exhaustive python prerequisite packages required by modern video architectures
 RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     opencv-python-headless \
     imageio-ffmpeg \
@@ -113,7 +94,7 @@ RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     transformers\
     sageattention
 
-# Step C: Clone Required Custom Nodes and check for internal secondary dependencies
+
 # Clone KJNodes (Handles core math logic, image transformations, and structural loaders)
 RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
     if [ -f /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
@@ -214,9 +195,7 @@ RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
     if [ $i -eq 5 ]; then echo "model-download failed" >&2; exit 1; fi; \
     SLEEP=$(echo $BACKOFFS | cut -d ' ' -f $i); sleep $SLEEP; done
 
-# =============================================================================
-# 8. INPUT ASSET SEEDING & ENTRYPOINT RUNTIME
-# =============================================================================
+
 # Generate baseline input file paths and seed the default initialization source image
 RUN mkdir -p /comfyui/input
 RUN wget --progress=dot:giga \
