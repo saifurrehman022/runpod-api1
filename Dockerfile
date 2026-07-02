@@ -62,7 +62,7 @@ RUN chmod +x /usr/local/bin/comfy-node-install
 COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
-RUN mkdir -p /comfyui/custom_nodes
+RUN mkdir -p /comfyui/ComfyUI/custom_nodes
 
 RUN uv pip install --python /comfyui/.venv/bin/python --no-cache pip setuptools wheel
 
@@ -100,24 +100,24 @@ RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     echo "WARN: sageattention build failed — KJNodes will fall back to standard attention"
 
 # Custom nodes
-RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/ComfyUI/custom_nodes/ComfyUI-KJNodes && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/ComfyUI/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
     fi
 
-RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
+RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /comfyui/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt; \
     fi
 
-RUN git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git /comfyui/custom_nodes/ComfyUI-WanVideoWrapper && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git /comfyui/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt; \
     fi
 
-RUN git clone --depth 1 https://github.com/theUpsider/ComfyUI-Logic.git /comfyui/custom_nodes/ComfyUI-Logic && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt; \
+RUN git clone --depth 1 https://github.com/theUpsider/ComfyUI-Logic.git /comfyui/ComfyUI/custom_nodes/ComfyUI-Logic && \
+    if [ -f /comfyui/ComfyUI/custom_nodes/ComfyUI-Logic/requirements.txt ]; then \
+        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/ComfyUI/custom_nodes/ComfyUI-Logic/requirements.txt; \
     fi
 
 # NOTE: Well-Made/ComfyUI-Wan-SVI2Pro-FLF is a private/missing repo — skipped.
