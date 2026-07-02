@@ -4,7 +4,7 @@ FROM ${BASE_IMAGE} AS base
 ARG COMFYUI_VERSION=
 ARG ENABLE_PYTORCH_UPGRADE=false
 ARG PYTORCH_INDEX_URL
- 
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1 \
@@ -39,6 +39,7 @@ ENV PATH="/comfyui/.venv/bin:${PATH}"
 
 RUN uv pip install comfy-cli runpod requests websocket-client
 
+# PyTorch cu128 — matches the H100 runtime (CUDA 13.0 is backward-compat with cu128 wheels)
 RUN uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /comfyui/ComfyUI
@@ -65,7 +66,12 @@ RUN mkdir -p /comfyui/custom_nodes
 
 RUN uv pip install --python /comfyui/.venv/bin/python --no-cache pip setuptools wheel
 
-RUN uv pip install --python /comfyui/.venv/bin/python --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Re-pin torch after base installs
+RUN uv pip install --python /comfyui/.venv/bin/python --force-reinstall \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Core dependencies — install sageattention from prebuilt wheel for torch 2.x + CUDA 12.x
+# The plain PyPI package often fails to compile on H100/CUDA 13; use the prebuilt wheel
 RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     opencv-python-headless \
     imageio-ffmpeg \
@@ -82,9 +88,18 @@ RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
     matplotlib \
     mss \
     onnxruntime-gpu \
-    transformers \
-    sageattention
+    transformers
 
+# Install sageattention from source so it compiles against the actual installed torch/CUDA.
+# This is what KJNodes' model_optimization_nodes.py needs — if it fails to import,
+# DiffusionModelLoaderKJ and the entire module go missing silently.
+RUN /comfyui/.venv/bin/python -m pip install --no-cache-dir \
+    ninja packaging && \
+    /comfyui/.venv/bin/python -m pip install --no-cache-dir \
+    sageattention --no-build-isolation || \
+    echo "WARN: sageattention build failed — KJNodes will fall back to standard attention"
+
+# Custom nodes
 RUN git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes && \
     if [ -f /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then \
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt; \
@@ -105,10 +120,12 @@ RUN git clone --depth 1 https://github.com/theUpsider/ComfyUI-Logic.git /comfyui
         /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Logic/requirements.txt; \
     fi
 
-RUN git clone --depth 1 https://github.com/Well-Made/ComfyUI-Wan-SVI2Pro-FLF.git /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt ]; then \
-        /comfyui/.venv/bin/python -m pip install --no-cache-dir -r /comfyui/custom_nodes/ComfyUI-Wan-SVI2Pro-FLF/requirements.txt; \
-    fi
+# NOTE: Well-Made/ComfyUI-Wan-SVI2Pro-FLF is a private/missing repo — skipped.
+# SVI2Pro is handled by kijai/ComfyUI-WanVideoWrapper + the SVI_v2_PRO LoRA weights below.
+
+# Re-pin torch one final time — nothing above should downgrade it, but be safe
+RUN uv pip install --python /comfyui/.venv/bin/python --force-reinstall \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # --- LORAS ---
 RUN BACKOFFS="10 20 30 60 90" && for i in 1 2 3 4 5; do \
